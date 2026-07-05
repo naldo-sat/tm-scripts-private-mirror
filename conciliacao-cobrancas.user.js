@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Conciliação de Cobranças — ConectaChip
 // @namespace    naldo.conectachip.cobrancas
-// @version      1.5.7
-// @description  v1.5.7: auto-update migrado do gist para o repo tm-scripts-private-mirror
+// @version      1.6.0
+// @description  v1.6.0: botão "Pausar assinaturas em massa" (Alterar situação → Pausado) em Serviços Recorrentes
 // @match        https://portal.conectachip.com.br/financeiro/movimentacoes_financeiras/index_recebimento*
 // @match        https://portal.conectachip.com.br/contratos/gestao_assinaturas/servicos_recorrentes*
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/conciliacao-cobrancas.user.js
@@ -16,6 +16,27 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v1.6.0
+────────────────────────────────────────────────────────
+1. PAUSAR ASSINATURAS EM MASSA — novo botão (laranja) em Serviços Recorrentes
+   - Ao lado de "Gerar faturas". Itera todas as linhas de todas as páginas.
+   - Por linha (fluxo mapeado no DevTools): abre "Mais ações" → clica "Alterar
+     situação" → no form, seleciona "Pausado" no <select name="situacao_id"> →
+     clica "Alterar".
+   - TRAVA DE SEGURANÇA: só clica "Alterar" depois de confirmar que o select
+     ficou em "Pausado" (nunca submete outra situação). Acha o form de edição
+     pelo par (opção "Pausado" + botão "Alterar"), distinguindo de filtros.
+   - Confirmação inicial (window.confirm) + botão "Parar" + retomar-após-reload
+     (KEY_PAUSAR_RUN) + log/resumo, reusando a infra do batch de faturas.
+   - RECOMENDADO: filtrar situação para "Ativo" antes de rodar.
+   - Blindagens (review adversarial):
+     • ANTI-LINHA-ERRADA: pega o form pelo snapshot antes/depois do clique (só
+       aceita o form que ABRIU nesta linha) + dispensa forms órfãos; se o form
+       não fechar após "Alterar", conta falha (não OK).
+     • EXCLUSÃO MÚTUA: Gerar faturas / Gerar boletos / Pausar não rodam juntos
+       (guard no start de cada) e o resume-após-reload retoma no máx. 1 (prioriza
+       Pausar).
+
 CHANGELOG v1.5.6
 ────────────────────────────────────────────────────────
 1. PUBLICAÇÃO EM GIST + AUTO-UPDATE
@@ -181,6 +202,7 @@ CHANGELOG v1.3.0
       valorSelector: 'td[aria-colindex="8"]',
       hasGerarBoletos: false,
       hasGerarFaturas: true,
+      hasPausarAssinaturas: true,
       exportName: 'Conciliações de serviços recorrentes',
     },
   ];
@@ -199,6 +221,7 @@ CHANGELOG v1.3.0
 
   const KEY_XLSX        = 'cr:planilha';
   const KEY_FATURAS_RUN = 'cr:faturas:run'; // persistência do batch de faturas
+  const KEY_PAUSAR_RUN  = 'cr:pausar:run';  // persistência do batch de pausar assinaturas
   const PFX_AUTO        = 'cr:auto:';
   const PFX_MANUAL      = 'cr:manual:';
   const PFX_FALHA       = 'cr:falha:';
@@ -217,6 +240,7 @@ CHANGELOG v1.3.0
   let cachedColNome  = -1;
   let gerandoBoletos = false;
   let gerandoFaturas = false;
+  let pausandoAssinaturas = false;
   let errosNaUltimaOp = 0;          // incrementado pelo initModalAutoConfirm em erros reais
   let ultimoErroFoiJaGerado = false;// setado quando o modal de erro diz "Já existe recebimento"
   const RE_JA_GERADO = /j[aá] existe.{0,40}recebimento/i;
@@ -931,6 +955,8 @@ CHANGELOG v1.3.0
       toast('Processo interrompido');
       return;
     }
+    // Exclusão mútua: não roda junto com faturas/pause (mesmo DOM).
+    if(gerandoFaturas||pausandoAssinaturas){ toast('Outro processo em andamento — pare-o antes'); return; }
     gerandoBoletos=true;
     atualizarBtnGerar('<i class="fa fa-stop"></i> Parar','#dc3545');
 
@@ -985,7 +1011,7 @@ CHANGELOG v1.3.0
     const obs = new MutationObserver(() => {
       // GATING: zero interferência se nenhum batch está rodando
       // Isso permite ao usuário usar o ERP manualmente sem intercepção.
-      if (!gerandoBoletos && !gerandoFaturas) return;
+      if (!gerandoBoletos && !gerandoFaturas && !pausandoAssinaturas) return;
 
       const modal = document.querySelector('#modal-dialog___BV_modal_content_');
       if (!modal) return;
@@ -998,7 +1024,7 @@ CHANGELOG v1.3.0
         const txt = (modal.querySelector('.modal-body')?.textContent || '').trim();
         const jaGerado = RE_JA_GERADO.test(txt);
 
-        if (gerandoBoletos || gerandoFaturas) {
+        if (gerandoBoletos || gerandoFaturas || pausandoAssinaturas) {
           if (jaGerado) ultimoErroFoiJaGerado = true;
           else errosNaUltimaOp++;
         }
@@ -1008,10 +1034,12 @@ CHANGELOG v1.3.0
           okBtn.dataset.crAutoClose = '1';
           setTimeout(() => okBtn.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true})), 200);
         }
-      } else if (isConfirm && gerandoBoletos) {
-        // Boletos: auto-confirm legado (clique automático no "Sim")
-        // Faturas: NÃO tratamos aqui — o clique no "Sim" é explícito dentro do fluxo
-        //         (evita race entre auto-confirm e detecção do modal)
+      } else if (isConfirm && (gerandoBoletos || pausandoAssinaturas)) {
+        // Boletos/Pausar: auto-confirm (clique automático no "Sim"). No pausar é rede de
+        //   segurança — o mapeamento do Naldo mostrou submit inline SEM modal, mas se o ERP
+        //   exibir um "Deseja alterar a situação?", o consentimento já veio no confirm() inicial.
+        //   Detecção de fim do pause é pelo form fechar (não pelo modal) → sem race.
+        // Faturas: NÃO tratamos aqui — o clique no "Sim" é explícito dentro do fluxo.
         const simBtn = modal.querySelector('button[value="true"]');
         if (simBtn && !simBtn.dataset.crAuto) {
           simBtn.dataset.crAuto = '1';
@@ -1278,6 +1306,8 @@ CHANGELOG v1.3.0
       toast('Processo interrompido');
       return;
     }
+    // Exclusão mútua: não roda junto com o pause de assinaturas (mesmo DOM).
+    if (pausandoAssinaturas || gerandoBoletos) { toast('Outro processo em andamento — pare-o antes'); return; }
 
     gerandoFaturas = true;
     atualizarBtnGerarFaturas('<i class="fa fa-stop"></i> Parar', '#dc3545');
@@ -1395,6 +1425,176 @@ CHANGELOG v1.3.0
   }
 
   // ============================================================
+  // PAUSAR ASSINATURAS EM MASSA (Serviços Recorrentes) — v1.6.0
+  // Fluxo mapeado no DevTools (Naldo): "Mais ações" → "Alterar situação" →
+  //   form com <select name="situacao_id"> → escolher "Pausado" → botão "Alterar".
+  // Trava: só clica "Alterar" DEPOIS de confirmar que o select ficou em "Pausado".
+  // ============================================================
+  let logPausar = []; // [{nome, status:'ok'|'falha', tentativas, motivo}]
+
+  function salvarProgressoPausar(state){ try { GM_setValue(KEY_PAUSAR_RUN, JSON.stringify(state)); } catch {} }
+  function carregarProgressoPausar(){ try { const v=GM_getValue(KEY_PAUSAR_RUN); return v?JSON.parse(v):null; } catch { return null; } }
+  function limparProgressoPausar(){ try { GM_deleteValue(KEY_PAUSAR_RUN); } catch {} }
+
+  function atualizarBtnPausar(html, bg){
+    const btn=document.getElementById('cr-btn-pausar');
+    if(!btn)return; btn.innerHTML=html; btn.style.background=bg; btn.style.borderColor=bg;
+  }
+
+  // Retorna os <select name="situacao_id"> que pertencem a um FORM DE EDIÇÃO visível
+  // (tem opção "Pausado" E botão "Alterar" no mesmo form) — exclui o FILTRO da página (que
+  // tem "Buscar", não "Alterar"). count:2 no DevTools = filtro + form; só o form entra aqui.
+  function editSelectsSituacao(){
+    return [...document.querySelectorAll('select[name="situacao_id"]')].filter(s=>{
+      if(s.offsetParent===null)return false;
+      const form=s.form||s.closest('form, .modal-content, .modal-body');
+      if(!form)return false;
+      const btnAlterar=[...form.querySelectorAll('button')].some(b=>/^alterar$/i.test((b.textContent||'').trim()) && b.offsetParent!==null);
+      const optPausado=[...s.options].some(o=>/^pausad/i.test((o.textContent||'').trim()));
+      return btnAlterar && optPausado;
+    });
+  }
+  function formDoSelect(s){
+    const form=s.form||s.closest('form, .modal-content, .modal-body');
+    const btn=form?[...form.querySelectorAll('button')].find(b=>/^alterar$/i.test((b.textContent||'').trim()) && b.offsetParent!==null):null;
+    const opt=[...s.options].find(o=>/^pausad/i.test((o.textContent||'').trim()));
+    return {sel:s, btn, opt};
+  }
+  // Fecha qualquer form de edição de situação órfão (de uma linha anterior que falhou) — best-effort.
+  // Sem isso, um form deixado aberto poluiria a próxima linha. O snapshot antes/depois do clique
+  // (em tentarPausarLinha) é a TRAVA real; isto só faz limpeza pra não acumular.
+  function dispensarFormSituacao(){
+    for(const s of editSelectsSituacao()){
+      const form=s.form||s.closest('form, .modal-content, .modal-body');
+      if(!form)continue;
+      const cancelar=[...form.querySelectorAll('button,a')].find(b=>/^(cancelar|voltar|fechar)$/i.test((b.textContent||'').trim()) && b.offsetParent!==null);
+      if(cancelar) cancelar.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+    }
+    document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,which:27,bubbles:true}));
+  }
+
+  async function tentarPausarLinha(tr, tentativa){
+    const nome=getNomeERP(tr)||'(sem nome)';
+    // Limpa qualquer form de edição órfão e tira um "snapshot" dos que restarem abertos, pra
+    // NÃO confundir com o form desta linha (senão poderia pausar a assinatura ERRADA).
+    dispensarFormSituacao(); await esperar(150);
+    const antes=new Set(editSelectsSituacao());
+    const { menu } = await abrirDropdownLinha(tr);
+    if(!menu){ console.warn(`[CR][Pausar] ${nome} · tent.${tentativa} · menu-nao-abriu`); return {ok:false,motivo:'menu-nao-abriu'}; }
+    // "Alterar situação" (item direto do dropdown)
+    const item=[...menu.querySelectorAll('a.dropdown-item')].find(a=>/alterar\s+situa/i.test((a.textContent||'').trim()) && a.offsetParent!==null);
+    if(!item){ fecharTodosDropdowns(); console.warn(`[CR][Pausar] ${nome} · sem "Alterar situação"`); return {ok:false,motivo:'item-alterar-situacao-nao-encontrado'}; }
+    errosNaUltimaOp=0; ultimoErroFoiJaGerado=false;
+    item.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+    // Espera um form de edição NOVO (select que NÃO estava no snapshot) — garante que é o desta linha.
+    const novoSel=await aguardarCondicao(()=>{ const s=editSelectsSituacao().find(x=>!antes.has(x)); return s||null; }, TIMEOUT_MODAL_OPEN);
+    if(!novoSel){ dispensarFormSituacao(); console.warn(`[CR][Pausar] ${nome} · form-situacao-nao-abriu`); return {ok:false,motivo:'form-situacao-nao-abriu'}; }
+    const alvo=formDoSelect(novoSel);
+    if(!alvo.btn||!alvo.opt){ dispensarFormSituacao(); console.warn(`[CR][Pausar] ${nome} · form-incompleto`); return {ok:false,motivo:'form-incompleto'}; }
+    // Seleciona SÓ "Pausado" (dispara input+change pro BootstrapVue)
+    alvo.sel.value=alvo.opt.value;
+    alvo.sel.dispatchEvent(new Event('input',{bubbles:true}));
+    alvo.sel.dispatchEvent(new Event('change',{bubbles:true}));
+    await esperar(200);
+    // TRAVA DE SEGURANÇA: só submete se realmente ficou em "Pausado"
+    const selText=(alvo.sel.options[alvo.sel.selectedIndex]?.textContent||'').trim();
+    if(!/^pausad/i.test(selText)){ dispensarFormSituacao(); console.warn(`[CR][Pausar] ${nome} · nao-selecionou-pausado (ficou "${selText}")`); return {ok:false,motivo:'nao-selecionou-pausado'}; }
+    // Clica "Alterar" (submit)
+    alvo.btn.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));
+    // Espera o form fechar (o select some) OU o backend responder
+    const fechou=await aguardarCondicao(()=> !document.body.contains(alvo.sel) || alvo.sel.offsetParent===null, TIMEOUT_MODAL_CLOSE);
+    await esperar(DELAY_POS_CONFIRM);
+    // Se o form NÃO fechou, o backend não confirmou (rejeição/erro) → não conta como OK e limpa.
+    if(!fechou){ dispensarFormSituacao(); console.warn(`[CR][Pausar] ${nome} · form-nao-fechou-apos-alterar`); return {ok:false,motivo:'form-nao-fechou'}; }
+    console.log(`[CR][Pausar] ${nome} · tent.${tentativa} · OK`);
+    return {ok:true,motivo:null};
+  }
+
+  async function pausarAssinaturaLinha(tr){
+    const nome=getNomeERP(tr)||'(sem nome)';
+    fecharTodosDropdowns(); await esperar(250);
+    let r=await tentarPausarLinha(tr,1);
+    if(r.ok){ aplicarCor(tr,'verde'); logPausar.push({nome,status:'ok',tentativas:1,motivo:null}); atualizarBadge(); return r; }
+    fecharTodosDropdowns(); await esperar(DELAY_RETRY);
+    r=await tentarPausarLinha(tr,2);
+    if(r.ok){ aplicarCor(tr,'verde'); logPausar.push({nome,status:'ok',tentativas:2,motivo:null}); }
+    else logPausar.push({nome,status:'falha',tentativas:2,motivo:r.motivo});
+    atualizarBadge(); return r;
+  }
+
+  async function pausarAssinaturas(estadoInicial){
+    // se veio um Event (clique) em vez de estado, ignora
+    if(estadoInicial && estadoInicial.processados === undefined && estadoInicial.res === undefined) estadoInicial = null;
+    if(pausandoAssinaturas){
+      pausandoAssinaturas=false;
+      atualizarBtnPausar('<i class="fa fa-pause"></i> Pausar assinaturas','#e67e22');
+      limparProgressoPausar(); toast('Processo interrompido'); return;
+    }
+    // Exclusão mútua: não deixa 2 batches dirigindo o mesmo DOM ao mesmo tempo.
+    if(gerandoFaturas||gerandoBoletos){ toast('Outro processo em andamento — pare-o antes de pausar assinaturas'); return; }
+    if(!estadoInicial && !confirm('Pausar em MASSA todas as assinaturas listadas (todas as páginas)?\n\n⚠️ Filtre a situação para "Ativo" ANTES de rodar — senão pode mexer em finalizadas.\nVocê pode clicar em "Parar" a qualquer momento.')) return;
+    pausandoAssinaturas=true;
+    atualizarBtnPausar('<i class="fa fa-stop"></i> Parar','#dc3545');
+    const processados=new Set(estadoInicial?.processados||[]);
+    const res=estadoInicial?.res||{pausadas:0,falhas:0};
+    let totalPaginas=estadoInicial?.totalPaginas||0;
+    logPausar=[];
+    if(estadoInicial){ console.log(`[CR][Pausar] === RETOMANDO (${processados.size} já processados) ===`); toast(`Retomando: ${processados.size} já processados`); }
+    else console.log('[CR][Pausar] === Início do pause em massa ===');
+    // try/finally: garante que a flag/botão/storage SEMPRE resetam, mesmo se algo lançar
+    // no meio do loop (senão o botão ficaria preso em "Parar" e bloquearia os outros batches).
+    try {
+      while(pausandoAssinaturas){
+        totalPaginas++;
+        let linhasNaPagina=0;
+        while(pausandoAssinaturas){
+          const tr=[...document.querySelectorAll(SEL.ROWS)].find(t=>{ const k=chaveLinha(t); return k && !processados.has(k); });
+          if(!tr)break;
+          const chave=chaveLinha(tr);
+          processados.add(chave); linhasNaPagina++;
+          if(linhasNaPagina===1) toast(`Página ${totalPaginas} — pausando...`);
+          const r=await pausarAssinaturaLinha(tr);
+          if(r.ok)res.pausadas++; else res.falhas++;
+          salvarProgressoPausar({ativo:true,processados:[...processados],res,totalPaginas,atualizadoEm:Date.now()});
+          await esperar(DELAY_ENTRE_LINHAS);
+        }
+        if(!pausandoAssinaturas)break;
+        const nextBtn=proximaPaginaBtn();
+        if(!nextBtn)break;
+        nextBtn.click();
+        await aguardarAtualizacaoTabela(3500);
+      }
+    } catch(e){
+      console.error('[CR][Pausar] Erro fatal no loop:', e);
+      toast('Erro no processo de pausar — veja o console');
+    } finally {
+      pausandoAssinaturas=false;
+      atualizarBtnPausar('<i class="fa fa-pause"></i> Pausar assinaturas','#e67e22');
+      limparProgressoPausar();
+    }
+    console.log('[CR][Pausar] === Fim. Resumo:', res, '==='); console.table(logPausar);
+    mostrarModalResumoPausar(res);
+    mostrarPainelLogFaturas(logPausar);
+  }
+
+  function mostrarModalResumoPausar(res){
+    document.getElementById('cr-modal-resumo')?.remove();
+    const overlay=document.createElement('div'); overlay.id='cr-modal-resumo';
+    overlay.innerHTML=`
+      <div class="cr-resumo-box">
+        <div class="cr-resumo-header">Resumo — pausar assinaturas</div>
+        <div class="cr-resumo-body">
+          <div class="cr-resumo-item cr-resumo-verde">⏸ Pausadas: <b>${res.pausadas}</b></div>
+          <div class="cr-resumo-item cr-resumo-vermelho">❌ Falhas: <b>${res.falhas}</b></div>
+        </div>
+        <div class="cr-resumo-footer"><button class="btn btn-primary" id="cr-resumo-fechar">Fechar</button></div>
+      </div>`;
+    document.body.appendChild(overlay);
+    document.getElementById('cr-resumo-fechar').addEventListener('click',()=>overlay.remove());
+    overlay.addEventListener('click',e=>{ if(e.target===overlay)overlay.remove(); });
+  }
+
+  // ============================================================
   // TOOLBAR — 1ª linha (.botoes): botões de ação + badges
   // ============================================================
   function injetarToolbarPrincipal(){
@@ -1466,6 +1666,17 @@ CHANGELOG v1.3.0
       btnF.title='Gera a próxima fatura de todas as assinaturas em todas as páginas (confirma modal automaticamente)';
       btnF.addEventListener('click',gerarFaturas);
       container.appendChild(btnF);
+    }
+
+    // Botão "Pausar assinaturas" — só na página de Serviços Recorrentes
+    if (PAGE.hasPausarAssinaturas && !document.getElementById('cr-btn-pausar')) {
+      const btnP=document.createElement('button');
+      btnP.id='cr-btn-pausar';btnP.type='button';btnP.className='btn ml-2';
+      btnP.style.cssText='background:#e67e22;border:1px solid #e67e22;color:#fff;';
+      btnP.innerHTML='<i class="fa fa-pause"></i> Pausar assinaturas';
+      btnP.title='Pausa (Alterar situação → Pausado) todas as assinaturas listadas, em todas as páginas. Filtre por "Ativo" antes. Botão Parar interrompe.';
+      btnP.addEventListener('click',()=>pausarAssinaturas());
+      container.appendChild(btnP);
     }
 
     // Botão "Filtro" — toggle do wrapper de filtros
@@ -1648,20 +1859,22 @@ CHANGELOG v1.3.0
       if (PAGE.hasGerarBoletos || PAGE.hasGerarFaturas) initModalAutoConfirm();
       observar();
 
-      // Retomar run de faturas se houve reload no meio do batch
-      if (PAGE.hasGerarFaturas) {
-        const run = carregarProgressoFaturas();
-        if (run?.ativo) {
-          const idade = Date.now() - (run.atualizadoEm || 0);
-          // Só retoma se for recente (< 5 min) — evita pegar lixo de sessão antiga
-          if (idade < 5 * 60 * 1000) {
-            console.log(`[CR][Fatura] Detectado run ativo (${run.processados?.length||0} processados) — retomando em 2s...`);
-            setTimeout(() => gerarFaturas(run), 2000);
-          } else {
-            console.warn('[CR][Fatura] Run antigo (>5min) descartado');
-            limparProgressoFaturas();
-          }
-        }
+      // Retomar run após reload — NO MÁXIMO UM batch (nunca faturas + pausar juntos).
+      // Prioriza PAUSAR (é o destrutivo). Descarta runs antigos (>5min).
+      const FRESCO = 5 * 60 * 1000;
+      const runP = PAGE.hasPausarAssinaturas ? carregarProgressoPausar() : null;
+      const runF = PAGE.hasGerarFaturas ? carregarProgressoFaturas() : null;
+      const pAtivo = runP?.ativo && (Date.now() - (runP.atualizadoEm || 0)) < FRESCO;
+      const fAtivo = runF?.ativo && (Date.now() - (runF.atualizadoEm || 0)) < FRESCO;
+      if (runP?.ativo && !pAtivo) limparProgressoPausar();   // antigo → limpa
+      if (runF?.ativo && !fAtivo) limparProgressoFaturas();  // antigo → limpa
+      if (pAtivo) {
+        if (fAtivo) { console.warn('[CR] Dois runs ativos — retomando só PAUSAR; faturas descartado'); limparProgressoFaturas(); }
+        console.log(`[CR][Pausar] Run ativo (${runP.processados?.length || 0}) — retomando em 2s...`);
+        setTimeout(() => pausarAssinaturas(runP), 2000);
+      } else if (fAtivo) {
+        console.log(`[CR][Fatura] Run ativo (${runF.processados?.length || 0}) — retomando em 2s...`);
+        setTimeout(() => gerarFaturas(runF), 2000);
       }
     },300);
   }
