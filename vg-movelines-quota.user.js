@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.7.0
+// @version      9.7.1
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,30 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.7.1 — FIX CRÍTICO nome fabricado
+─────────────────────────────────────────────────────────────
+Bug: quando a Vivo mandava payload de moveLines SEM
+payload.sourceGroup.name (só o id), o handleMoveLines caía no
+fallback `GRUPO ${srcId}`. Isso corrompia a herança:
+   • R1 renomeava destino com nome fabricado "GRUPO 36604362"
+     em vez do nome real "01. DIÁRIO - 5GB"
+   • GATE 1 procurava destino pelo nome antigo real (que ele
+     conhece pelo executarLote) → não achava → timeout 30s
+
+Por que __moveGroupMap estava vazio:
+   loadViewUI faz fetch com isOwnRequest=true (interceptor pula),
+   então o mapa só era populado por listLines interceptados —
+   e o payload de listLines nem sempre tem group.name.
+
+Fix (2 camadas):
+  1. loadViewUI popula __moveGroupMap como side-effect (todo grupo
+     retornado ganha entrada no mapa).
+  2. executarLote sincroniza mapa a partir de gruposCache antes de
+     iniciar o loop (redundância defensiva).
+
+Testar: rodar a mesma conta NALDO SAT — R1 deve renomear pelo nome
+real (ex "01. DIÁRIO - 5GB") e GATE 1 confluir imediatamente.
+
 CHANGELOG v9.7.0 — Herança 3-em-3 (grupos NORMAIS)
 ─────────────────────────────────────────────────────────────
 Análise multi-agente (9 agentes) escolheu esta arquitetura:
@@ -870,6 +894,9 @@ CHANGELOG v9.0.0
         if (n.id != null && n.name != null) all.push(n);
         for (const c of (Array.isArray(n) ? n : Object.values(n))) if (c && typeof c === 'object') walk(c);
       })(lv);
+      // v9.7.1 — alimenta __moveGroupMap. Sem isso, handleMoveLines cai no
+      // fallback "GRUPO <id>" e o R1 renomeia destino com nome fabricado.
+      for (const g of all) pageWindow.__moveGroupMap[String(g.id)] = { name: g.name };
       return all;
     } catch (_) { return []; }
     finally { isOwnRequest = false; }
@@ -1143,6 +1170,10 @@ CHANGELOG v9.0.0
     if (goBtn) { goBtn.disabled = true; goBtn.textContent = 'rodando…'; }
     let ok = 0, fail = 0, parou = false;
     const total = marcados.length;
+
+    // v9.7.1 — blindagem: garante que __moveGroupMap conhece TODOS os
+    // grupos numerados (evita fallback "GRUPO <id>" no handleMoveLines).
+    for (const g of gruposCache) pageWindow.__moveGroupMap[String(g.id)] = { name: g.name };
 
     // v9.6.0 — gravação na planilha (início + fim), padrão ui2ui
     const gravarLog = isCfg('gravarPlanilha');
@@ -1899,7 +1930,7 @@ CHANGELOG v9.0.0
     setTimeout(() => { if (isCfg('colorir')) restoreColors(); }, 300);
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
-    log('✅ MoveLines + Cota v9.7.0 (herança 3-em-3) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
+    log('✅ MoveLines + Cota v9.7.1 (herança 3-em-3) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
