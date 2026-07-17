@@ -1,15 +1,167 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      8.14.0
+// @version      9.6.2
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
-// @description  Detecta moveLines para "GRUPO SEM LINHAS", aguarda re-render Angular, renomeia grupos e aplica cota automaticamente.
+// @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
 // @author       Naldo Nascimento
 // @match        https://vivogestao.vivoempresas.com.br/Portal/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      script.google.com
+// @connect      script.googleusercontent.com
 // @run-at       document-start
 // ==/UserScript==
+
+/*
+CHANGELOG v9.6.2
+─────────────────────────────────────────────────────────────
+1. FIX HTTP 500 · CAP cota individual pra caber no grupo
+   • Vivo rejeita saveLines quando soma (cotaPorLinha × qtdLinhas)
+     ultrapassa a cota do grupo (HTTP 500 · "Erro interno!").
+   • Grupos com nome tipo "10GB" mas mais linhas do que a cota comporta
+     (ex.: 16 linhas × 10GB = 160GB num grupo de 80GB) sofriam sempre.
+   • Fix: calcula capMax = floor((grupoGB / qtdLinhas) × 100) / 100 e
+     usa cotaPorLinha = min(nominal, capMax). Loga o corte em azul (hl):
+     "⚠ cota nominal 10GB/linha × 16 = 160GB estoura o grupo (80GB) ·
+      reduzindo pra 5GB/linha".
+   • Comportamento preservado quando cabe: usa a nominal do nome.
+
+CHANGELOG v9.6.1
+─────────────────────────────────────────────────────────────
+1. FIX CRÍTICO — interceptor XHR/fetch usa unsafeWindow
+   • @grant GM_xmlhttpRequest (v9.6.0) ativou o sandbox do Tampermonkey
+   • window.XMLHttpRequest = ... e window.fetch = ... deixaram de
+     substituir os objetos reais que o Angular usa (só sobrescreviam o
+     wrapper do sandbox). Interceptor virou no-op.
+   • Consequência: handleMoveLines nunca era chamado → postMoveFlow
+     nunca rodava → linha era movida mas grupo não era renomeado.
+   • Fix: adicionar @grant unsafeWindow e usar `pageWindow` (=unsafeWindow
+     quando disponível) nos overrides XHR/fetch e nos globals
+     __moveGroupMap / __loadViewListeners.
+2. FIX aguardarPostMove — não retorna true prematuramente
+   • Novo flag postMoveIniciado: só considera concluído quando
+     realmente iniciou. Timeout de 90s continua como safety net.
+
+CHANGELOG v9.6.0
+─────────────────────────────────────────────────────────────
+1. PAINEL SIMPLIFICADO — só 3 checkboxes visíveis:
+   • Aplicar cota nas linhas ilimitadas (default OFF, lógica ui2ui)
+   • Colorir linhas concluídas (default ON)
+   • Gravação na planilha (default ON, lógica ui2ui + @grant GM_xmlhttpRequest)
+   • REMOVIDOS: Renomear (hardcoded ON), Aplicar cota (hardcoded ON),
+     Recarregar view (hardcoded ON) — não são mais opcionais.
+
+2. GRUPOS ILIMITADOS — comportamento alinhado ao ui2ui
+   • Se checkbox OFF: linhas voltam SEM cota individual (uso livre) em vez
+     de zeradas. Payload de saveLines sem os campos quota/futureQuota
+     (deixa a Vivo cair pra cota do grupo compartilhada).
+   • Grupo destino ainda recebe cota do GD sempre (como no v9.5).
+   • Origem sempre zerada (grupo sem linhas fica zerado).
+
+3. GRAVAÇÃO NA PLANILHA (padrão ui2ui — Acessos VG)
+   • Início do lote → status "Renovando..."
+   • Fim → "OK: X/N | HH:MM — duração (Xmin Ys)" ou "Falha:..."
+   • GM_xmlhttpRequest contorna CORS; mapa abasPorConta idêntico ao ui2ui.
+
+CHANGELOG v9.5.0
+─────────────────────────────────────────────────────────────
+1. GRUPO DESTINO SEMPRE RECEBE COTA (nunca é pulada)
+   • Grupo NORMAL: cota destino = cota TOTAL da origem (transferência 1:1)
+   • Grupo ILIMITADO: cota destino = TODA cota disponível do GD (unallocatedQuota)
+2. RESET origem SEMPRE zera "grupo sem linhas" (independente do tipo)
+3. Checkbox "Aplicar cota em ilimitados" agora vale APENAS pra
+   cota INDIVIDUAL das linhas (saveLines). A cota do grupo destino
+   é sempre aplicada em ilimitado — só a distribuição por linha muda.
+4. findGdGroup volta a ser usado (só pra determinar cota destino
+   quando grupo é ilimitado).
+
+CHANGELOG v9.4.0
+─────────────────────────────────────────────────────────────
+1. COTA TRANSFERIDA DIRETO ORIGEM → DESTINO (sem GD)
+   • Captura cota TOTAL da origem antes do RESET (via cache do loadView)
+   • Aplica essa MESMA cota total no destino (não depende do nome pra calcular)
+   • Fallback pelo nome: se cache não tem, extrai quotaPerLine × N linhas do nome
+   • Ordem: RESET origem → renomeio → setar cota grupo destino → saveLines
+2. REMOVIDA dependência do GD
+   • Checkbox "Usar GD como fallback" retirado
+   • Função findGdGroup mantida (não usada mais) por retrocompat
+   • Referência de cota agora é sempre ORIGEM ↔ DESTINO
+3. NOVO CHECKBOX "Aplicar cota em ilimitados" (default OFF)
+   • Detecção: nome bate /ilimitad[oa]s?/i (ilimitado/a/os/as)
+   • Se OFF e grupo é ilimitado → pula RESET + setGroupQuota + saveLines
+     (só o renomeio acontece — respeito integral à natureza "ilimitada")
+
+CHANGELOG v9.3.0
+─────────────────────────────────────────────────────────────
+1. FIX: COTA — RESET DA ORIGEM antes de aplicar no destino (portado do ui2ui)
+   • A conta Vivo tem cota TOTAL fixa. Se a origem ainda tem X GB alocado
+     (mesmo vazia após o move), setar X GB no destino é REJEITADO por falta
+     de saldo. Solução: ZERAR a cota da origem primeiro, aí o destino recebe.
+   • Ordem nova: renomear origem → RESET origem (0 GB) → renomear destino →
+     aplicar cota no destino → applyQuotaToLines
+2. LOGS DETALHADOS DE API (facilita diagnóstico)
+   • Nível `dbg` (cinza) mostra payload+response de cada chamada
+   • Erros mostram JSON completo da response
+   • fetchDestGroupQuota, renameGroup, trySetGroupQuota, applyQuotaToLines
+3. TAB COMPACTA (padrão ui2ui) — sem gradiente/pulse, seta + texto verticais
+
+CHANGELOG v9.2.0
+─────────────────────────────────────────────────────────────
+1. ANTI-MISTURA (padrão ui2ui portado) — 2 gates por grupo
+   • GATE 0 (pré-move): "GRUPO SEM LINHAS" precisa estar VAZIO
+     (só históricas bcs='1' são toleradas). Se houver linha ativa,
+     ABORTA o lote com log claro — evita empilhar linhas alheias.
+   • GATE 1 (pós-move+renomeio): valida que os N MSISDNs esperados
+     estão no grupo destino renomeado e que a origem ficou vazia.
+   • Ambos usam loadView (leitura, não é movimentação).
+2. PAINEL INICIA RECOLHIDO — só expande ao clicar na tab lateral.
+3. TAB MAIS VISUAL — seta grande + fundo pulsando (identifica melhor).
+
+CHANGELOG v9.1.0
+─────────────────────────────────────────────────────────────
+1. MODO PRÓ-ATIVO (padrão ui2ui) — lista de grupos + botão ▶ INICIAR
+   • loadView carrega todos os grupos numerados (exclui GD)
+   • Checkboxes: usuário marca os grupos que quer processar
+   • Botão "todos/nenhum" pra marcar em lote
+   • Ao clicar ▶ INICIAR: script move linhas de cada grupo pro
+     "GRUPO SEM LINHAS" (via cliques UI), e o watchdog atual
+     (postMoveFlow) cuida do renomeio + cota
+   • Barra de progresso: X/N grupos, % concluído, grupo atual
+   • Som ao fim (sucesso ou falha)
+   • Modo REATIVO original continua funcionando em paralelo
+
+2. Helpers do ui2ui portados: loadView, moverPorCliques,
+   expandDetalhado, carregarLinhas, selecionarDestino, etc.
+
+CHANGELOG v9.0.0
+─────────────────────────────────────────────────────────────
+1. UI PADRÃO CONECTACHIP — sidebar fixa à ESQUERDA (340px)
+   • Header azul ConectaChip (#2157d9)
+   • Checkboxes de configuração (persistidos em localStorage)
+   • Área de logs em tempo real (dark, colorido)
+   • Tab lateral pra minimizar/restaurar
+   • Posicionamento evita sobreposição com vivo-renova (que fica à direita)
+
+2. CHECKBOXES DE CONFIGURAÇÃO
+   • Renomear grupos após movimentação
+   • Aplicar cota automática (extract do nome ex "10GB")
+   • Usar GD como fallback de cota quando origem insuficiente
+   • Colorir linhas concluídas
+   • Recarregar view após conclusão
+
+3. LOGS DUPLICADOS — painel + console
+   • log('msg', 'ok'|'err'|'hl') aparece no painel E no console
+   • Painel mantém histórico completo · botão "copiar log"
+
+4. LÓGICA 100% PRESERVADA
+   • Continua reativa: usuário move linhas manualmente pra "grupo sem linhas"
+   • Interceptação XHR/fetch, waitForLoadViewBurst, todos os cálculos
+   • "Grupo sem linhas" segue como grupo intermediário (nome fixo da origem
+     pós-movimentação; é renomeado com o nome antigo da origem)
+─────────────────────────────────────────────────────────────
+*/
 
 (function () {
   'use strict';
@@ -31,9 +183,8 @@
     API_GROUP: 'https://vivogestao.vivoempresas.com.br/Portal/api/datapackmanagergroup',
 
     // Controle do waitForLoadViewBurst
-    LOAD_VIEW_WAIT_MS:    300,   // silêncio após último loadView para considerar tabela estável
-                                  // seguro: devtools mostra apenas 1 loadView após moveLines
-    LOAD_VIEW_TIMEOUT_MS: 18000, // timeout máximo aguardando o Angular re-renderizar
+    LOAD_VIEW_WAIT_MS:    300,
+    LOAD_VIEW_TIMEOUT_MS: 18000,
 
     // Pausa antes de clicar em "Consumo de Dados"
     DELAY_BEFORE_RELOAD: 400,
@@ -47,12 +198,41 @@
   const EXPIRY_MS   = 20 * 60 * 60 * 1000; // 20 horas
 
   /* ─────────────────────────────────────────────────────────
+   *  v9.0.0 — CHECKBOXES DE CONFIGURAÇÃO (persistidos)
+   * ───────────────────────────────────────────────────────── */
+  const CFG_UI = {
+    ilim:            { key: 'mlq_aplicar_ilim',   label: 'Aplicar cota nas linhas ilimitadas', default: false, tip: 'Refere-se apenas à cota INDIVIDUAL das linhas (saveLines). A cota do GRUPO destino sempre é aplicada (recebe toda a cota disponível do GD). MARCADO: também distribui cota linha-a-linha. DESMARCADO (padrão): linhas ficam sem cota individual (uso livre da cota do grupo).' },
+    colorir:         { key: 'mlq_colorir',        label: 'Colorir linhas concluídas',          default: true,  tip: 'Marca em VERDE a linha do grupo destino quando tudo dá certo, ou VERMELHO quando falta cota. Persiste 20h no localStorage.' },
+    gravarPlanilha:  { key: 'mlq_gravar_planilha',label: 'Gravação na planilha',               default: true,  tip: 'Grava na planilha do Acessos VG o status do lote: início ("Renovando...") e fim ("OK: X/N | HH:MM — duração"). Precisa da conta ativa detectada e mapeada. DESMARCADO: nenhuma chamada ao Apps Script.' },
+  };
+  // v9.6.0 — Hardcoded: renomeio + aplicar cota + reload view sempre ON
+  const cfgUI = {};
+  for (const [k, v] of Object.entries(CFG_UI)) {
+    const stored = localStorage.getItem(v.key);
+    cfgUI[k] = stored === null ? v.default : stored === '1';
+  }
+  // Fixos (não expostos no painel — sempre ligados)
+  cfgUI.renomear    = true;
+  cfgUI.aplicarCota = true;
+  cfgUI.reload      = true;
+  const isCfg  = (k) => !!cfgUI[k];
+  const setCfg = (k, val) => {
+    cfgUI[k] = !!val;
+    try { if (CFG_UI[k]) localStorage.setItem(CFG_UI[k].key, val ? '1' : '0'); } catch (_) {}
+  };
+
+  /* ─────────────────────────────────────────────────────────
    *  ESTADO GLOBAL
    * ───────────────────────────────────────────────────────── */
-  window.__moveGroupMap      = window.__moveGroupMap      || {};
-  window.__loadViewListeners = window.__loadViewListeners || [];
+  // v9.6.1 — pageWindow: com @grant GM_xmlhttpRequest ativo, o script roda em
+  // sandbox e `window` deixa de ser o mesmo da página. Pra que os overrides
+  // XHR/fetch peguem as chamadas do Angular do portal Vivo, PRECISAMOS operar
+  // no `unsafeWindow` (que é o window real da página). Fallback pra window
+  // quando @grant none / sem Tampermonkey.
+  const pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  pageWindow.__moveGroupMap      = pageWindow.__moveGroupMap      || {};
+  pageWindow.__loadViewListeners = pageWindow.__loadViewListeners || [];
 
-  // Parâmetros de sessão capturados do body do moveLines
   const session = {
     sessionId:  null,
     acessLogin: null,
@@ -60,7 +240,6 @@
     remoteIp:   null,
   };
 
-  // Dados da movimentação em curso
   let pendingMove = {
     active:          false,
     sourceGroupId:   null,
@@ -70,15 +249,29 @@
     account:         null,
   };
 
-  let groupQuotaCache = {}; // id → { total, consumed, available }
-  let isOwnRequest    = false; // evita que nossas próprias chamadas sejam interceptadas
+  let groupQuotaCache = {};
+  let isOwnRequest    = false;
+
+  // v9.0.0 — logger unificado (painel + console). Antes do mount(), só console.
+  const logBuffer = []; // guarda logs pré-UI pra despejar depois
+  let uiLogFn = null;   // setado pelo mount()
+  function log(msg, cls) {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    const ts = p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    const linha = ts + '  ' + msg;
+    logBuffer.push({ msg: linha, cls });
+    if (uiLogFn) uiLogFn(linha, cls);
+    // Console com cores por classe
+    const cor = cls === 'ok' ? '#22c55e' : cls === 'err' ? '#ef4444' : cls === 'hl' ? '#3b82f6' : '#64748b';
+    console.log('%c[VG MLQ] ' + linha, 'color:' + cor + ';font-weight:' + (cls === 'hl' ? 'bold' : 'normal'));
+  }
 
   /* ─────────────────────────────────────────────────────────
    *  UTILITÁRIOS
    * ───────────────────────────────────────────────────────── */
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  // Retorna a cota disponível de um grupo pelo id (via groupQuotaCache)
   function getAvailableQuota(id) {
     const c = groupQuotaCache[String(id)];
     if (!c) return 0;
@@ -86,14 +279,12 @@
     return c;
   }
 
-  // Salva cota no cache: total, consumido e disponível (total − consumido)
   function saveQuotaCache(id, total, consumed) {
     const t = parseFloat(total)    || 0;
     const c = parseFloat(consumed) || 0;
     groupQuotaCache[String(id)] = { total: t, consumed: c, available: Math.max(0, t - c) };
   }
 
-  // Extrai valor numérico de GB do nome do grupo (ex: "10GB" → 10)
   function extractQuotaFromGroupName(name) {
     if (!name) return 0;
     const m = name.match(/(\d+)\s*GB/i);
@@ -104,9 +295,52 @@
     return /\d+\s*GB/i.test(name || '');
   }
 
+  // v9.4.0 — detecta grupo ilimitado pelo nome (qualquer variação)
+  const REGEX_ILIMITADO = /ilimitad[oa]s?/i;
+  function isIlimitado(name) { return REGEX_ILIMITADO.test(name || ''); }
+
   /* ─────────────────────────────────────────────────────────
-   *  MAPA DE GRUPOS — populado pelas respostas da API
-   *  unallocatedQuota.value = disponível real (confirmado)
+   *  v9.6.0 — GRAVAÇÃO NA PLANILHA (padrão ui2ui/Acessos VG)
+   * ───────────────────────────────────────────────────────── */
+  const LOG_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbyTFeoT4YlDVsMHssirQXUcRf55JyojZymykl9ygY8u9f_xvRBEMZ8nd68Zj3A9Xl6o/exec';
+  const abasPorConta = {
+    "0455828133":"NALDO SAT","0459325639":"NALDO SAT","0453979554":"NALDO SAT","0444346918":"NALDO SAT","0450619128":"NALDO SAT",
+    "0452109744":"STUDIO ML","0454860388":"STUDIO ML","0444225746":"STUDIO ML","0457460616":"STUDIO ML","0462105797":"STUDIO ML","0466121938":"STUDIO ML",
+    "0463297834":"F DE ASSIS","0451176465":"F DE ASSIS","0443889484":"F DE ASSIS","0461401781":"F DE ASSIS",
+    "0469102728":"CONNECTA","0469103350":"CONNECTA",
+    "0468571160":"CN Engenharia","0469296149":"CN Engenharia","0469301552":"CN Engenharia","0469288595":"CN Engenharia"
+  };
+  function obterContaAtiva() {
+    try { const saved = sessionStorage.getItem('vg_contaAtual'); if (saved && /^\d{10}$/.test(saved)) return saved; } catch (_) {}
+    const toggle = document.querySelector('a.dropdown-toggle');
+    if (!toggle) return null;
+    const m = toggle.textContent.match(/\d{10}/);
+    return m ? m[0] : null;
+  }
+  function gravarLogNaPlanilha(conta, aba, status, observacao) {
+    if (!conta || !aba) return Promise.resolve({ skipped: true, reason: 'sem conta ou aba' });
+    if (typeof GM_xmlhttpRequest !== 'function') return Promise.resolve({ skipped: true, reason: 'GM_xmlhttpRequest indisponível' });
+    return new Promise(resolve => {
+      GM_xmlhttpRequest({
+        method:  'POST',
+        url:     LOG_WEB_APP_URL,
+        headers: { 'Content-Type': 'application/json' },
+        data:    JSON.stringify({ conta: conta, aba: aba, status: status, observacao: observacao || '' }),
+        timeout: 20000,
+        onload:    r => { try { resolve(JSON.parse(r.responseText)); } catch (e) { resolve({ success: false, error: 'resposta não-JSON' }); } },
+        onerror:   e => resolve({ success: false, error: 'erro de rede' }),
+        ontimeout: () => resolve({ success: false, error: 'timeout' })
+      });
+    });
+  }
+  function hhmm(d) { d = d || new Date(); const p = n => String(n).padStart(2, '0'); return p(d.getHours()) + ':' + p(d.getMinutes()); }
+  function durStr(ms) {
+    const s = Math.floor(ms / 1000), m = Math.floor(s / 60), r = s % 60;
+    return m > 0 ? (m + 'min ' + r + 's') : (r + 's');
+  }
+
+  /* ─────────────────────────────────────────────────────────
+   *  MAPA DE GRUPOS
    * ───────────────────────────────────────────────────────── */
   function captureGroupMap(text) {
     try {
@@ -114,7 +348,7 @@
       if (Array.isArray(d?.groupList)) {
         d.groupList.forEach(g => {
           if (!g.id || !g.name) return;
-          window.__moveGroupMap[String(g.id)] = { name: g.name };
+          pageWindow.__moveGroupMap[String(g.id)] = { name: g.name };
           const total    = parseFloat(g.quota?.value) || 0;
           const consumed = parseFloat(g.quotaConsume?.value ?? g.quotaConsumption?.value ?? 0) || 0;
           const unalloc  = parseFloat(g.unallocatedQuota?.value) || 0;
@@ -125,24 +359,18 @@
         });
       }
       if (d?.group?.id && d?.group?.name) {
-        window.__moveGroupMap[String(d.group.id)] = { name: d.group.name };
+        pageWindow.__moveGroupMap[String(d.group.id)] = { name: d.group.name };
       }
     } catch (_) {}
   }
 
   function resolveGroupName(id) {
-    const e = window.__moveGroupMap[String(id)];
+    const e = pageWindow.__moveGroupMap[String(id)];
     return typeof e === 'string' ? e : (e?.name || '');
   }
 
   /* ─────────────────────────────────────────────────────────
    *  LEITURA DE COTA VIA getGroupMoveLines
-   *
-   *  Faz uma chamada fresca ao endpoint, popula groupQuotaCache
-   *  para TODOS os grupos retornados (inclui GD) e retorna a
-   *  cota disponível do grupo destino especificado.
-   *  Uma única chamada de API cobre destino e fallback GD.
-   *  Campo confirmado: unallocatedQuota.value = disponível real.
    * ───────────────────────────────────────────────────────── */
   async function fetchDestGroupQuota(destGroupId) {
     isOwnRequest = true;
@@ -183,12 +411,11 @@
         return Math.max(0, total - consumed);
       }
 
-      // Popula cache de todos os grupos numa única chamada — cobre destino e GD
       function populateAll(obj) {
         if (!obj || typeof obj !== 'object') return;
         if (Array.isArray(obj)) { obj.forEach(populateAll); return; }
         if (obj.id && obj.name) {
-          window.__moveGroupMap[String(obj.id)] = { name: obj.name };
+          pageWindow.__moveGroupMap[String(obj.id)] = { name: obj.name };
           const avail = extractAvail(obj);
           groupQuotaCache[String(obj.id)] = {
             total:    parseFloat(obj.quota?.value) || 0,
@@ -200,19 +427,17 @@
       }
       populateAll(d);
 
-      return extractAvail(find(d, target));
-    } catch (_) { return 0; }
+      const avail = extractAvail(find(d, target));
+      // v9.3.0 — log detalhado
+      const gruposCap = Object.keys(pageWindow.__moveGroupMap).length;
+      log('  [DBG] getGroupMoveLines · destId=' + target + ' · destAvail=' + avail.toFixed(2) + ' GB · grupos cacheados=' + gruposCap, 'dbg');
+      return avail;
+    } catch (e) { log('  [DBG] getGroupMoveLines · exceção: ' + e.message, 'err'); return 0; }
     finally { isOwnRequest = false; }
   }
 
-  /* ─────────────────────────────────────────────────────────
-   *  LOCALIZAÇÃO DO GRUPO GD
-   *  Busca no groupMap grupo com nome iniciando em "GD",
-   *  excluindo origem e destino da movimentação atual.
-   *  Retorna { id, name } ou null (garantido único pelo portal).
-   * ───────────────────────────────────────────────────────── */
   function findGdGroup(excludeIds = []) {
-    for (const [id, entry] of Object.entries(window.__moveGroupMap)) {
+    for (const [id, entry] of Object.entries(pageWindow.__moveGroupMap)) {
       if (excludeIds.includes(id)) continue;
       const name = typeof entry === 'object' ? (entry.name || '') : String(entry);
       if (/^gd\b/i.test(name)) return { id, name };
@@ -220,11 +445,6 @@
     return null;
   }
 
-  /* ─────────────────────────────────────────────────────────
-   *  CAPTURA DE SESSÃO
-   *  Extrai sessionId, acessLogin, remoteHost e remoteIp
-   *  diretamente do body do moveLines (sem depender de URLs)
-   * ───────────────────────────────────────────────────────── */
   function captureSessionFromPayload(payload) {
     if (payload.sessionId)  session.sessionId  = payload.sessionId;
     if (payload.acessLogin) session.acessLogin = payload.acessLogin;
@@ -238,7 +458,6 @@
   function isTargetMove(payload) {
     if (!payload || payload.action !== 'moveLines') return false;
     if (!payload.destinationGroup || !payload.sourceGroup) return false;
-    // Ignora a chamada de validação (preflight) — só processa o moveLines real
     if (payload.validate) return false;
     const dId   = String(payload.destinationGroup.id || '');
     const dName = payload.destinationGroup.name || resolveGroupName(dId) || '';
@@ -246,7 +465,7 @@
   }
 
   function handleMoveLines(payload) {
-    if (pendingMove.active) return; // já monitorando uma movimentação
+    if (pendingMove.active) return;
 
     captureSessionFromPayload(payload);
 
@@ -263,20 +482,14 @@
       account:         payload.account || payload.lines?.[0]?.account || null,
     };
 
-    // Aguarda o Angular re-renderizar a tabela antes de agir
+    log('▶ moveLines detectado · origem "' + srcName + '" → destino "GRUPO SEM LINHAS" · ' + (payload.lines || []).length + ' linha(s)', 'hl');
+    atualizarStatusUI('Aguardando re-render Angular…');
+
     setTimeout(() => {
       waitForLoadViewBurst().then(() => postMoveFlow());
     }, 0);
   }
 
-  /* ─────────────────────────────────────────────────────────
-   *  ESPERA PELO loadView PÓS-MOVIMENTAÇÃO
-   *
-   *  O Angular dispara uma ou mais chamadas GET loadView ao
-   *  re-renderizar a tabela após o moveLines ser processado.
-   *  Aguardamos pelo menos 1 chamada + LOAD_VIEW_WAIT_MS de
-   *  silêncio antes de iniciar o fluxo pós-movimentação.
-   * ───────────────────────────────────────────────────────── */
   function waitForLoadViewBurst() {
     return new Promise(resolve => {
       let count   = 0;
@@ -288,15 +501,14 @@
         quietId = setTimeout(() => { unsubscribe(); resolve(); }, CFG.LOAD_VIEW_WAIT_MS);
       };
 
-      window.__loadViewListeners.push(onLoadView);
+      pageWindow.__loadViewListeners.push(onLoadView);
 
       const unsubscribe = () => {
-        const idx = window.__loadViewListeners.indexOf(onLoadView);
-        if (idx !== -1) window.__loadViewListeners.splice(idx, 1);
+        const idx = pageWindow.__loadViewListeners.indexOf(onLoadView);
+        if (idx !== -1) pageWindow.__loadViewListeners.splice(idx, 1);
         if (quietId) clearTimeout(quietId);
       };
 
-      // Segurança: resolve após timeout máximo mesmo sem nenhum loadView
       setTimeout(() => {
         if (count === 0) { unsubscribe(); resolve(); }
       }, CFG.LOAD_VIEW_TIMEOUT_MS);
@@ -304,103 +516,161 @@
   }
 
   /* ─────────────────────────────────────────────────────────
-   *  FLUXO PÓS-MOVIMENTAÇÃO — v8.14.0
-   *
-   *  ETAPA 0 — Leitura prévia (getGroupMoveLines)
-   *  ETAPA 1 — Renomeio
-   *  ETAPA 2 — Cota (principal → fallback GD)
-   *  ETAPA 3 — Coloração + reload (após cota aplicada)
+   *  FLUXO PÓS-MOVIMENTAÇÃO — v9.4.0
+   *  Novo modelo: cota TRANSFERIDA direto origem→destino (sem GD).
+   *  Ordem: capturar cota origem → RESET origem (0 GB) → renomeios →
+   *  setar cota destino = cota origem → aplicar cota individual nas linhas.
+   *  Grupos ilimitados: se checkbox "aplicar em ilimitados" OFF, pula tudo.
    * ───────────────────────────────────────────────────────── */
   async function postMoveFlow() {
     const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
+    log('  [DBG] postMoveFlow · sourceGroupId=' + sourceGroupId + ' · sourceGroupName="' + sourceGroupName + '" · destGroupId=' + destGroupId + ' · lines=' + lines.length, 'dbg');
 
-    // ── ETAPA 0: lê cota atual e popula cache de todos os grupos ──
-    const destAvail = await fetchDestGroupQuota(destGroupId) || getAvailableQuota(destGroupId);
+    // ── Detecta se o grupo é ilimitado ─────────────────────
+    const ilim = isIlimitado(sourceGroupName);
+    if (ilim) log('  · grupo ILIMITADO detectado · cota destino virá do GD · cota individual das linhas: ' + (isCfg('ilim') ? 'SIM' : 'NÃO (checkbox)'));
 
-    // ── ETAPA 1: Renomeio ─────────────────────────────────
-    try {
-      await renameGroup(sourceGroupId, CFG.EMPTY_NAME);
-      await renameGroup(destGroupId, sourceGroupName);
-    } catch (err) {
-      console.error('%c[VG Auto] ⚠️ Renomeio falhou (fluxo continua):', 'color:#f59e0b;font-weight:bold;', err.message);
+    // ── ETAPA 0: captura cotas atuais (destino + origem) ──
+    const destAvail   = await fetchDestGroupQuota(destGroupId) || getAvailableQuota(destGroupId);
+    const cacheOrigem = groupQuotaCache[String(sourceGroupId)] || {};
+    const originTotal = parseFloat(cacheOrigem.total) || getAvailableQuota(sourceGroupId) || 0;
+    log('  [DBG] cotas capturadas · destino_avail=' + destAvail.toFixed(2) + ' GB · origem_TOTAL=' + originTotal.toFixed(2) + ' GB', 'dbg');
+
+    // ── ETAPA 1a: RESET cota da origem — SEMPRE (o "grupo sem linhas" fica zerado) ──
+    if (isCfg('aplicarCota') && originTotal > 0) {
+      atualizarStatusUI('Zerando cota da origem…');
+      log('  · RESET · zerando cota da origem [' + sourceGroupId + '] (libera ' + originTotal.toFixed(2) + ' GB)…');
+      const rz = await trySetGroupQuota(sourceGroupId, sourceGroupName, 0);
+      if (rz.ok) log('  ✓ cota da origem zerada', 'ok');
+      else       log('  ⚠ RESET falhou · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || '') + ' — cota do destino provavelmente falhará', 'err');
+      await sleep(600);
     }
 
-    // ── ETAPA 2: Cota ─────────────────────────────────────
-    let cotaSuficiente = true;
-    let gdUsado        = false;
+    // ── ETAPA 1b: Renomeio ORIGEM (opcional) ──
+    if (isCfg('renomear')) {
+      try {
+        atualizarStatusUI('Renomeando origem → "GRUPO SEM LINHAS"…');
+        log('  · renomeando origem [' + sourceGroupId + '] → "GRUPO SEM LINHAS"');
+        await renameGroup(sourceGroupId, CFG.EMPTY_NAME);
+        log('  ✓ origem renomeada', 'ok');
+      } catch (err) {
+        log('  ⚠ renomeio origem falhou: ' + err.message, 'err');
+      }
+    } else {
+      log('  ⏭ renomeio DESATIVADO (checkbox)');
+    }
 
-    if (hasQuotaInGroupName(sourceGroupName)) {
-      const quotaPerLine     = extractQuotaFromGroupName(sourceGroupName);
-      const quotaNeeded      = quotaPerLine * lines.length;
-      const originAvail      = getAvailableQuota(sourceGroupId);
-      const neededFromOrigin = Math.max(0, quotaNeeded - destAvail);
-
-      if (originAvail >= neededFromOrigin) {
-        // ── Fluxo principal ───────────────────────────────
-        const { ok } = await trySetGroupQuota(destGroupId, sourceGroupName, quotaNeeded);
-        if (ok && lines.length > 0) {
-          await applyQuotaToLines(destGroupId, quotaPerLine, lines);
-          logConclusao({ sourceGroupName, lines, quotaPerLine, quotaNeeded, destAvail, neededFromOrigin, gdUsado: false });
-        } else if (!ok) {
-          cotaSuficiente = false;
-        }
-
-      } else {
-        // ── Fallback GD ───────────────────────────────────
-        const gdRemainder = neededFromOrigin - originAvail;
-        const gdGroup     = findGdGroup([String(sourceGroupId), String(destGroupId)]);
-        const gdAvail     = gdGroup ? getAvailableQuota(gdGroup.id) : 0;
-
-        if (gdGroup && gdAvail >= gdRemainder) {
-          const { ok } = await trySetGroupQuota(destGroupId, sourceGroupName, quotaNeeded);
-          if (ok && lines.length > 0) {
-            await applyQuotaToLines(destGroupId, quotaPerLine, lines);
-            logConclusao({ sourceGroupName, lines, quotaPerLine, quotaNeeded, destAvail, neededFromOrigin, gdUsado: true, gdNome: gdGroup.name, gdRemainder });
-          } else if (!ok) {
-            cotaSuficiente = false;
-          }
-        } else {
-          console.error(
-            `%c[VG Auto] ❌ Cota insuficiente: origem ${originAvail.toFixed(2)} GB + GD ${gdAvail.toFixed(2)} GB < necessário ${neededFromOrigin.toFixed(2)} GB`,
-            'color:#ef4444;font-weight:bold;'
-          );
-          cotaSuficiente = false;
-        }
+    // ── ETAPA 1c: Renomeio DESTINO (opcional) ──
+    if (isCfg('renomear')) {
+      try {
+        atualizarStatusUI('Renomeando destino → "' + sourceGroupName + '"…');
+        log('  · renomeando destino [' + destGroupId + '] → "' + sourceGroupName + '"');
+        await renameGroup(destGroupId, sourceGroupName);
+        log('  ✓ destino renomeado', 'ok');
+      } catch (err) {
+        log('  ⚠ renomeio destino falhou: ' + err.message, 'err');
       }
     }
 
-    // ── ETAPA 3: Coloração e reload após cota aplicada ────
-    if (cotaSuficiente) {
-      saveStatus(destGroupId, 'ok');
-      colorirComRetentativa(destGroupId);
+    // ── ETAPA 2: Cota no destino (SEMPRE aplica) ──
+    let cotaSuficiente = true;
+    if (isCfg('aplicarCota')) {
+      atualizarStatusUI('Aplicando cota no destino…');
+
+      // Determina a cota do grupo destino:
+      //   - Grupo NORMAL:    cota TOTAL da origem (transferência 1:1)
+      //   - Grupo ILIMITADO: TODA a cota disponível do GD (unallocatedQuota)
+      let quotaGrupoDest = 0;
+      let origemLabel    = '';
+      if (ilim) {
+        // Refresh do cache pós-RESET pra pegar cota disponível do GD atualizada
+        await fetchDestGroupQuota(destGroupId); // popula cache
+        const gd = findGdGroup([String(sourceGroupId), String(destGroupId)]);
+        if (gd) {
+          const gdCache = groupQuotaCache[String(gd.id)] || {};
+          quotaGrupoDest = parseFloat(gdCache.available) || 0;
+          origemLabel = 'GD "' + gd.name + '" [' + gd.id + '] · disponível=' + quotaGrupoDest.toFixed(2) + ' GB';
+          log('  [DBG] cota destino (ilimitado) · ' + origemLabel, 'dbg');
+        } else {
+          log('  ⚠ grupo GD não encontrado — usando cota da origem como fallback', 'err');
+          quotaGrupoDest = originTotal;
+          origemLabel = 'origem (fallback · GD não achado) · ' + originTotal.toFixed(2) + ' GB';
+        }
+      } else {
+        quotaGrupoDest = originTotal;
+        origemLabel = 'origem (transferência 1:1) · ' + originTotal.toFixed(2) + ' GB';
+        // Fallback: se cache não tinha, deriva do nome
+        if (!quotaGrupoDest) {
+          const perLine = extractQuotaFromGroupName(sourceGroupName);
+          if (perLine && lines.length) {
+            quotaGrupoDest = perLine * lines.length;
+            origemLabel = 'nome (fallback) · ' + perLine + ' × ' + lines.length + ' = ' + quotaGrupoDest.toFixed(2);
+          }
+        }
+      }
+      log('  [DBG] cota grupo destino = ' + quotaGrupoDest.toFixed(2) + ' GB · origem: ' + origemLabel, 'dbg');
+
+      if (quotaGrupoDest > 0) {
+        log('  · aplicando ' + quotaGrupoDest.toFixed(2) + ' GB no destino [' + destGroupId + ']…');
+        const r = await trySetGroupQuota(destGroupId, sourceGroupName, quotaGrupoDest);
+        if (r.ok) {
+          log('  ✓ cota do grupo aplicada · sev=' + (r.json?.severity || 'ok'), 'ok');
+
+          // ── ETAPA 3: cota INDIVIDUAL nas linhas ──
+          //   - Grupo NORMAL: aplica cota específica (quotaPerLine)
+          //   - Grupo ILIMITADO + checkbox ON:  aplica quotaPerLine (extração do nome)
+          //   - Grupo ILIMITADO + checkbox OFF (padrão): aplica SEM cota individual
+          //     (payload sem quota/futureQuota) → linha fica em uso livre da cota do grupo
+          if (lines.length > 0) {
+            const aplicaCotaIndividual = !ilim || isCfg('ilim');
+            let quotaPerLine = null;
+            if (aplicaCotaIndividual) {
+              const nominal = extractQuotaFromGroupName(sourceGroupName) || (quotaGrupoDest / lines.length);
+              // v9.6.2 — CAP: soma das cotas individuais NÃO pode ultrapassar a cota do grupo
+              // (Vivo rejeita com HTTP 500 · "Erro interno!"). Reduzimos pra caber, arredondando pra baixo (2 casas).
+              const capMax = Math.floor((quotaGrupoDest / lines.length) * 100) / 100;
+              if (nominal > capMax) {
+                log('  ⚠ cota nominal ' + nominal + 'GB/linha × ' + lines.length + ' = ' + (nominal * lines.length).toFixed(2) + 'GB estoura o grupo (' + quotaGrupoDest.toFixed(2) + 'GB) · reduzindo pra ' + capMax + 'GB/linha', 'hl');
+                quotaPerLine = capMax;
+              } else {
+                quotaPerLine = nominal;
+              }
+            }
+            log('  · applyQuotaToLines · ' + lines.length + ' linha(s) · ' + (aplicaCotaIndividual ? (quotaPerLine + ' GB por linha') : 'SEM cota individual (uso livre)') + '…');
+            const rl = await applyQuotaToLines(destGroupId, quotaPerLine, lines);
+            if (rl.ok) log('  ✓ ' + (aplicaCotaIndividual ? 'cota individual aplicada' : 'linhas liberadas para uso livre'), 'ok');
+            else       { log('  ⚠ applyQuotaToLines FALHOU · sev=' + (rl.json?.severity || '?') + ' · result=' + (rl.json?.result || ''), 'err'); cotaSuficiente = false; }
+          }
+          log('  ✅ concluído · ' + sourceGroupName + ' · grupo=' + quotaGrupoDest.toFixed(2) + 'GB' + (ilim ? ' (do GD)' : ' (da origem)'), 'ok');
+        } else {
+          cotaSuficiente = false;
+          log('  ⚠ trySetGroupQuota FALHOU · sev=' + (r.json?.severity || '?') + ' · result=' + (r.json?.result || 'sem detalhes'), 'err');
+        }
+      } else {
+        log('  ⏭ sem cota pra aplicar · quotaGrupoDest=0');
+      }
     } else {
-      saveStatus(destGroupId, 'error');
-      colorirVermelhoComRetentativa(destGroupId);
+      log('  ⏭ aplicação de cota DESATIVADA (checkbox)');
     }
 
-    await sleep(CFG.DELAY_BEFORE_RELOAD);
-    clickConsumoDados();
-
+    // ── ETAPA 4: Coloração (opcional) + reload (opcional) ──
+    if (isCfg('colorir')) {
+      if (cotaSuficiente) { saveStatus(destGroupId, 'ok'); colorirComRetentativa(destGroupId); }
+      else                { saveStatus(destGroupId, 'error'); colorirVermelhoComRetentativa(destGroupId); }
+    }
+    if (isCfg('reload')) {
+      await sleep(CFG.DELAY_BEFORE_RELOAD);
+      clickConsumoDados();
+    }
+    atualizarStatusUI(cotaSuficiente ? 'Concluído · aguardando próximo movimento…' : 'Concluído com erro · aguardando próximo…');
     resetPendingMove();
   }
 
-  /* ─────────────────────────────────────────────────────────
-   *  LOG DE CONCLUSÃO — formato narrativo (Opção A)
-   * ───────────────────────────────────────────────────────── */
   function logConclusao({ sourceGroupName, lines, quotaPerLine, quotaNeeded, destAvail, neededFromOrigin, gdUsado, gdNome, gdRemainder }) {
-    const originUsado = neededFromOrigin.toFixed(2);
-    const gdLinha     = gdUsado
-      ? `  • GD (${gdNome}): ${gdRemainder.toFixed(2)} GB utilizados`
-      : '  • GD: não utilizado';
-
-    console.warn(
-      `%c[VG Auto] ✅ Movimentação concluída\n` +
-      `  • Grupo:    ${sourceGroupName} → ${lines.length} linha(s) × ${quotaPerLine} GB = ${quotaNeeded} GB necessário\n` +
-      `  • Destino:  ${destAvail.toFixed(2)} GB existentes (aproveitados)\n` +
-      `  • Origem:   ${originUsado} GB extraídos\n` +
-      gdLinha,
-      'color:#22c55e;font-weight:bold;'
-    );
+    const gdLinha = gdUsado
+      ? '   • GD (' + gdNome + '): ' + gdRemainder.toFixed(2) + ' GB'
+      : '   • GD: não utilizado';
+    log('✅ concluído · ' + sourceGroupName + ' · ' + lines.length + '× ' + quotaPerLine + 'GB = ' + quotaNeeded + 'GB · destino ' + destAvail.toFixed(2) + 'GB · origem ' + neededFromOrigin.toFixed(2) + 'GB' + (gdUsado ? ' · GD ' + gdRemainder.toFixed(2) + 'GB' : ''), 'ok');
   }
 
   function resetPendingMove() {
@@ -411,14 +681,434 @@
   }
 
   /* ─────────────────────────────────────────────────────────
-   *  CHAMADAS DE API
-   *  Extraídas do Conecta Cheat V11.3, adaptadas para usar
-   *  CFG.API_GROUP e a sessão capturada do payload.
+   *  v9.1.0 — HELPERS PORTADOS DO UI2UI (loadView + cliques)
+   *  Necessários pro modo pró-ativo (▶ INICIAR).
    * ───────────────────────────────────────────────────────── */
+  const DP_BASE   = 'https://vivogestao.vivoempresas.com.br' + CFG.API_PATH;
+  const STEP_MS   = 700;
+  const VERMAIS_MAX = 20;
+  const STEP = () => sleep(STEP_MS);
 
-  // Renomeia um grupo (envia para contexto dados e voz simultaneamente).
-  // Lê o body de cada resposta e valida severity === 'info' antes de retornar,
-  // eliminando a necessidade de delay fixo entre etapas.
+  function getUiSession() {
+    if (session.sessionId) return { sessionId: session.sessionId, remoteHost: session.remoteHost || '', remoteIp: session.remoteIp || '', acessLogin: session.acessLogin || '' };
+    // Fallback: tenta ler do performance/resource
+    try {
+      const u = performance.getEntriesByType('resource').map(e => e.name)
+        .filter(x => x.includes('datapackconsumption') && x.includes('loadView')).pop();
+      if (u) {
+        const p = new URLSearchParams(u.split('?')[1] || '');
+        const sid = p.get('sessionId');
+        if (sid) return { sessionId: sid, remoteHost: p.get('remoteHost') || '', remoteIp: p.get('remoteIp') || '', acessLogin: p.get('acessLogin') || '' };
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  async function loadViewUI(sess) {
+    isOwnRequest = true;
+    try {
+      const qsp = new URLSearchParams({ action: 'loadView', technology: '4G', startRow: '1', fetchSize: '2000', ...sess });
+      const lv = await (await fetch(DP_BASE + '?' + qsp, { headers: { Accept: 'application/json' } })).json();
+      const all = [];
+      (function walk(n) {
+        if (!n || typeof n !== 'object') return;
+        if (n.id != null && n.name != null) all.push(n);
+        for (const c of (Array.isArray(n) ? n : Object.values(n))) if (c && typeof c === 'object') walk(c);
+      })(lv);
+      return all;
+    } catch (_) { return []; }
+    finally { isOwnRequest = false; }
+  }
+
+  const ehGD_ui     = (g) => /(^|\s)GD\b|GD CONNECTA/i.test(g.name || '') && !/5G/i.test(g.name || '');
+  const numerado_ui = (g) => /^\s*\d/.test(g.name || '');
+
+  const qs  = (sel, root) => (root || document).querySelector(sel);
+  const qsa = (sel, root) => [...(root || document).querySelectorAll(sel)];
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visivel = (el) => !!(el && el.offsetParent !== null && !el.disabled);
+  function clickEl(el) { if (!el) throw new Error('elemento nulo'); try { el.scrollIntoView({ block: 'center' }); } catch (e) {} el.click(); }
+  function setCheck(el, val) { if (!el) return; if (el.checked !== val) el.click(); el.dispatchEvent(new Event('change', { bubbles: true })); el.dispatchEvent(new Event('input', { bubbles: true })); }
+
+  function acharBotao(txt, opt) {
+    opt = opt || {}; const alvo = norm(txt);
+    let bs = qsa('button').filter(b => norm(b.textContent) === alvo && visivel(b));
+    if (opt.purpura) { const rx = bs.filter(b => /purpura|text-purple/i.test(b.className || '')); if (rx.length) bs = rx; }
+    return opt.primeiro ? (bs[0] || null) : (bs[bs.length - 1] || null);
+  }
+
+  async function waitFor(fn, { timeout = 12000, interval = 250 } = {}) {
+    const t0 = Date.now();
+    for (;;) { let v; try { v = fn(); } catch (e) { v = null; } if (v) return v; if (Date.now() - t0 > timeout) throw new Error('timeout'); await sleep(interval); }
+  }
+
+  function ensureConsumo() { const icon = qs('span.icon-data-consumption-closed'); if (icon) { const a = icon.closest('a.anchor-context') || icon.closest('a'); if (a) a.click(); } }
+  const acharRow = (id) => { const bt = qs('[id="' + id + '-btedit"]') || qs('[id="' + id + '-btremove"]'); return bt ? bt.closest('.row.table_visible_row') : null; };
+  function colapsarGrupos() {
+    qsa('input[id^="selectAll"]').forEach(sa => { const id = sa.id.replace('selectAll', ''); const row = acharRow(id), exp = row && row.querySelector('span.expander'); if (exp) try { exp.click(); } catch (e) {} });
+  }
+  function fecharModais() {
+    qsa('ngb-modal-window, .modal.show, .modal.in, [role="dialog"]').forEach(m => { const x = m.querySelector('button.close, [aria-label="Close"]') || qsa('button', m).find(b => /cancelar|fechar/i.test(b.textContent || '')); if (x) try { x.click(); } catch (e) {} });
+    try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true })); } catch (e) {}
+  }
+
+  async function expandDetalhado(id, nome) {
+    const bt = qs('[id="' + id + '-btedit"]') || qs('[id="' + id + '-btremove"]');
+    if (!bt) { log('  ✗ EXPAND: btn [' + id + '-btedit] não achado no DOM', 'err'); return false; }
+    const row = bt.closest('.row.table_visible_row');
+    if (qs('#selectAll' + id)) { log('  · já expandido', 'ok'); return true; }
+    const alvo = () => qs('#selectAll' + id) || acharBotao('Ver Linhas', { primeiro: true });
+
+    const exp = row ? row.querySelector('span.expander') : null;
+    if (exp) {
+      try { clickEl(exp); } catch (e) {}
+      try { await waitFor(alvo, { timeout: 8000, interval: 200 }); return true; }
+      catch (e) { log('  ✗ expander não abriu em 8s', 'err'); }
+    }
+    // fallback: clica no card
+    const card = row ? (qsa('div', row).find(d => /float:\s*left/i.test(d.getAttribute('style') || '') && norm(d.textContent) === norm(nome)) || row) : null;
+    if (card) {
+      try { clickEl(card); } catch (e) {}
+      try { await waitFor(alvo, { timeout: 8000, interval: 200 }); return true; } catch (e) {}
+    }
+    return false;
+  }
+
+  async function carregarTodasLinhas() {
+    const vl = acharBotao('Ver Linhas', { primeiro: true });
+    if (vl) { clickEl(vl); await STEP(); }
+    let n = 0;
+    while (n < VERMAIS_MAX) { const vm = acharBotao('Ver mais linhas', { primeiro: true }); if (!vm) break; clickEl(vm); n++; await STEP(); }
+    if (acharBotao('Ver mais linhas', { primeiro: true })) throw new Error('ainda há "Ver mais linhas" após ' + VERMAIS_MAX);
+  }
+
+  async function selecionarDestino(dstId) {
+    for (let p = 0; p < 8; p++) {
+      const lab = qs('label[for="rdgroup' + dstId + '"]');
+      if (lab) { clickEl(lab); const rd = qs('#rdgroup' + dstId); if (rd) { try { rd.checked = true; rd.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {} } return true; }
+      const next = qs('li.page-item:not(.disabled) a[aria-label="Next"]');
+      if (!next) break;
+      clickEl(next); await sleep(700);
+      await waitFor(() => qs('label[for^="rdgroup"]'), { timeout: 8000 }).catch(() => {});
+    }
+    return false;
+  }
+
+  // Move via CLIQUES (source → dest). Só dispara — postMoveFlow lida com o resto.
+  async function moverPorCliques(srcId, srcNome, dstId, dstNome) {
+    log('  · expand "' + srcNome + '"…');
+    colapsarGrupos();
+    const okExp = await expandDetalhado(srcId, srcNome);
+    if (!okExp) return { ok: false, motivo: 'não expandiu "' + srcNome + '"' };
+    await STEP();
+    log('  · carregando linhas…');
+    await carregarTodasLinhas();
+    const sa = qs('#selectAll' + srcId);
+    if (!sa) return { ok: false, motivo: 'selectAll' + srcId + ' sumiu' };
+    setCheck(sa, true);
+    await STEP();
+    const mv = await waitFor(() => acharBotao('Mover para outro grupo', { primeiro: true }), { timeout: 9000 }).catch(() => null);
+    if (!mv) return { ok: false, motivo: '"Mover para outro grupo" não apareceu' };
+    log('  · abrindo modal de move…');
+    clickEl(mv);
+    await waitFor(() => qs('label[for^="rdgroup"]'), { timeout: 15000 }).catch(() => {});
+    await STEP();
+    log('  · selecionando destino "' + dstNome + '"…');
+    const okDst = await selecionarDestino(dstId);
+    if (!okDst) return { ok: false, motivo: 'destino rdgroup' + dstId + ' não selecionável' };
+    await STEP();
+    const c1 = await waitFor(() => acharBotao('Mover Linhas', { purpura: true }), { timeout: 9000 }).catch(() => null);
+    if (!c1) return { ok: false, motivo: '"Mover Linhas" não apareceu' };
+    log('  · confirmando "Mover Linhas"…');
+    clickEl(c1); await STEP();
+    const c2 = await waitFor(() => acharBotao('Mover', { purpura: true }), { timeout: 10000 }).catch(() => null);
+    if (!c2) return { ok: false, motivo: '"Mover" (final) não apareceu' };
+    clickEl(c2);
+    // O interceptador vai detectar o moveLines e disparar postMoveFlow — aguardamos.
+    return { ok: true };
+  }
+
+  // v9.6.1 — Aguarda postMoveFlow COMEÇAR (active=true) e DEPOIS terminar (active=false)
+  // Antes retornava true imediatamente se interceptor não disparasse — mascarava o bug.
+  async function aguardarPostMove(timeoutMs = 90000) {
+    const t0 = Date.now();
+    let hasStarted = false;
+    while (Date.now() - t0 < timeoutMs) {
+      if (pendingMove.active) hasStarted = true;
+      if (hasStarted && !pendingMove.active) return true;
+      await sleep(400);
+    }
+    if (!hasStarted) {
+      log('  ⚠ aguardarPostMove: pendingMove.active nunca ficou true — interceptor XHR/fetch NÃO disparou. Verifique @grant/unsafeWindow.', 'err');
+    }
+    return false;
+  }
+
+  // v9.2.0 — helpers de validação (portados do ui2ui)
+  const activeLines = (g) => (g?.lines || []).filter(l => String(l.blockConsumptionStatus) !== '1');
+  const msisdnOf    = (l) => String(l.lineNumber || l.msisdn || '').replace(/\D/g, '');
+
+  // GATE 0 — antes do move: destino "GRUPO SEM LINHAS" precisa estar funcionalmente VAZIO
+  // (ignora linhas históricas bcs='1'). Se tiver ativas, é resíduo de run anterior
+  // que renomeio não concluiu → risco de MISTURA. Aborta.
+  async function gateDestinoVazio(sess) {
+    const all = await loadViewUI(sess);
+    const semLinhas = all.filter(g => CFG.TARGET_DEST_PATTERN.test(g.name || ''));
+    if (semLinhas.length === 0) return { ok: false, motivo: 'nenhum "GRUPO SEM LINHAS" encontrado — crie no portal' };
+    if (semLinhas.length > 1) {
+      const ids = semLinhas.map(g => g.id).join(', ');
+      return { ok: false, motivo: 'existem ' + semLinhas.length + ' grupos "GRUPO SEM LINHAS" (ids: ' + ids + ') — renomeie/apague antes' };
+    }
+    const gd = semLinhas[0];
+    const ativas = activeLines(gd);
+    const historicas = (gd.lines || []).length - ativas.length;
+    if (ativas.length > 0) {
+      return { ok: false, motivo: '"GRUPO SEM LINHAS" (id ' + gd.id + ') tem ' + ativas.length + ' linha(s) ativa(s)' + (historicas ? ' + ' + historicas + ' histórica(s)' : '') + ' — RISCO DE MISTURA. Limpe antes' };
+    }
+    return { ok: true, destId: String(gd.id), destName: gd.name, historicas };
+  }
+
+  // GATE 1 — pós-move+renomeio: valida que os N MSISDNs esperados estão no
+  // grupo que agora tem o nome antigo da origem, e que o novo "GRUPO SEM LINHAS"
+  // (que era a origem) está vazio. Faz POLL — consistência eventual da Vivo.
+  async function gatePosMove(sess, expectMsisdns, expectCount, nomeAntigoOrigem, timeout = 30000) {
+    const t0 = Date.now();
+    let resumo = '';
+    while (Date.now() - t0 < timeout) {
+      const all = await loadViewUI(sess);
+      // Grupo destino: agora tem o nome antigo da origem (renomeado)
+      const destinoRenomeado = all.find(g => (g.name || '').trim() === (nomeAntigoOrigem || '').trim());
+      // Novo "GRUPO SEM LINHAS": era a origem, foi renomeada
+      const novoVazio = all.filter(g => CFG.TARGET_DEST_PATTERN.test(g.name || ''));
+      if (destinoRenomeado && novoVazio.length === 1) {
+        const ativas = activeLines(destinoRenomeado);
+        const vazio  = activeLines(novoVazio[0]);
+        const have = new Set(ativas.map(msisdnOf).filter(Boolean));
+        const faltam = [...expectMsisdns].filter(m => !have.has(m));
+        const extras = [...have].filter(m => !expectMsisdns.has(m));
+        resumo = 'destino=' + ativas.length + '/' + expectCount + ' · faltam ' + faltam.length + ' · extras(alheias) ' + extras.length + ' · novoVazio ativas ' + vazio.length;
+        if (faltam.length === 0 && extras.length === 0 && vazio.length === 0 && ativas.length === expectCount) {
+          return { ok: true };
+        }
+      } else {
+        resumo = 'aguardando renomeio · destinoRenomeado=' + !!destinoRenomeado + ' · novoVazio=' + novoVazio.length;
+      }
+      await sleep(2500);
+    }
+    return { ok: false, motivo: 'não confluiu em ' + Math.round(timeout / 1000) + 's (' + resumo + ')' };
+  }
+
+  /* ─────────────────────────────────────────────────────────
+   *  v9.1.0 — SOM DE FIM (Web Audio, mesmo do ui2ui)
+   * ───────────────────────────────────────────────────────── */
+  function tocarSomFim(ok) {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      const ctx = new AC();
+      const VOL = 0.6;
+      const tocarTom = (freq, tStart, dur, tipo) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = tipo || 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, ctx.currentTime + tStart);
+        gain.gain.exponentialRampToValueAtTime(VOL, ctx.currentTime + tStart + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + tStart + dur);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(ctx.currentTime + tStart);
+        osc.stop(ctx.currentTime + tStart + dur + 0.05);
+      };
+      if (ok) {
+        [[523.25,0,.18],[659.25,.15,.18],[783.99,.30,.18],[1046.5,.45,.35],[1318.5,.75,.35],[1567.9,1.05,.55]]
+          .forEach(([f,t,d]) => { tocarTom(f,t,d,'triangle'); tocarTom(f/2,t,d,'sine'); });
+      } else {
+        for (let i = 0; i < 3; i++) { const t0 = i * 0.45; tocarTom(440, t0, .20, 'square'); tocarTom(330, t0 + .22, .20, 'square'); }
+      }
+      setTimeout(() => { try { ctx.close(); } catch (e) {} }, 2200);
+    } catch (e) {}
+  }
+
+  /* ─────────────────────────────────────────────────────────
+   *  v9.1.0 — LISTA DE GRUPOS + EXECUÇÃO EM LOTE
+   * ───────────────────────────────────────────────────────── */
+  let gruposCache = [];
+  let executando  = false;
+
+  async function montarLista(listEl) {
+    listEl.innerHTML = '<div class="mlq-g" style="color:#94a3b8">carregando grupos…</div>';
+    try {
+      const sess = getUiSession();
+      if (!sess) { listEl.innerHTML = '<div class="mlq-g" style="color:#dc2626">sessão não encontrada — recarregue logado</div>'; return; }
+      const all = await loadViewUI(sess);
+      gruposCache = all
+        .filter(g => numerado_ui(g) && !ehGD_ui(g) && !CFG.TARGET_DEST_PATTERN.test(g.name || ''))
+        .map(g => ({ id: String(g.id), name: g.name, n: (g.lines || []).length }))
+        .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'pt', { numeric: true }));
+      if (!gruposCache.length) { listEl.innerHTML = '<div class="mlq-g">nenhum grupo numerado</div>'; return; }
+      listEl.innerHTML = '';
+      for (const g of gruposCache) {
+        const row = document.createElement('label');
+        row.className = 'mlq-g';
+        row.innerHTML = `<input type="checkbox" class="mlq-cb" value="${g.id}" checked><span class="nm"></span><span class="id">${g.id}</span><span class="ct">${g.n ? g.n + ' linha(s)' : 'vazio'}</span>`;
+        row.querySelector('.nm').textContent = g.name;
+        listEl.appendChild(row);
+      }
+      log('lista carregada · ' + gruposCache.length + ' grupo(s)', 'hl');
+    } catch (e) {
+      listEl.innerHTML = '<div class="mlq-g" style="color:#dc2626">erro: ' + (e && e.message || e) + '</div>';
+    }
+  }
+
+  function setProgresso(feitos, total, nomeAtual) {
+    const p = document.getElementById('mlq-progress');
+    if (!p) return;
+    const pct = total > 0 ? Math.round(feitos / total * 100) : 0;
+    p.classList.remove('hidden');
+    p.querySelector('.mlq-pg-count b').textContent = feitos;
+    p.querySelector('.mlq-pg-total').textContent = total;
+    p.querySelector('.mlq-pg-pct').textContent = pct + '%';
+    p.querySelector('.mlq-pg-fill').style.width = pct + '%';
+    p.querySelector('.mlq-pg-atual').textContent = nomeAtual || (feitos === total ? 'Concluído.' : 'Aguardando…');
+  }
+
+  async function executarLote() {
+    if (executando) return;
+    const marcados = qsa('#mlq-list .mlq-cb:checked').map(c => c.value);
+    if (!marcados.length) { log('marque ao menos 1 grupo.', 'err'); return; }
+    const sess = getUiSession();
+    if (!sess) { log('sessão não encontrada — recarregue logado.', 'err'); return; }
+
+    executando = true;
+    const goBtn = document.getElementById('mlq-go');
+    if (goBtn) { goBtn.disabled = true; goBtn.textContent = 'rodando…'; }
+    let ok = 0, fail = 0, parou = false;
+    const total = marcados.length;
+
+    // v9.6.0 — gravação na planilha (início + fim), padrão ui2ui
+    const gravarLog = isCfg('gravarPlanilha');
+    const logConta  = gravarLog ? obterContaAtiva() : null;
+    const logAba    = logConta ? (abasPorConta[logConta] || null) : null;
+    const tsInicio  = Date.now();
+    if (gravarLog) {
+      if (logConta && logAba) {
+        log('📝 planilha: conta ' + logConta + ' · aba "' + logAba + '" · registrando início…');
+        gravarLogNaPlanilha(logConta, logAba, 'Renovando...', 'Iniciada às ' + hhmm() + ' · ' + total + ' grupo(s)')
+          .then(r => log(r && r.success ? '✓ planilha: início registrado' : '⚠ planilha (início): ' + (r && r.error || 'falha'), r && r.success ? 'ok' : 'err'));
+      } else if (!logConta) log('⚠ planilha: conta ativa não detectada — logs NÃO serão gravados.', 'err');
+      else                  log('⚠ planilha: conta ' + logConta + ' sem mapeamento de aba — logs NÃO serão gravados.', 'err');
+    }
+
+    log('═══════ INICIANDO · ' + total + ' grupo(s) → "GRUPO SEM LINHAS" (isolamento anti-mistura) ═══════', 'hl');
+    setProgresso(0, total, 'Iniciando…');
+
+    for (let i = 0; i < marcados.length; i++) {
+      if (parou) break;
+      const gid = marcados[i];
+      const g   = gruposCache.find(x => x.id === gid);
+      const nome = g ? g.name : gid;
+      setProgresso(i, total, 'Processando: ' + nome);
+      log('▶ ' + nome + ' [' + gid + ']', 'hl');
+
+      try {
+        // ── GATE 0 (pré-move): destino "GRUPO SEM LINHAS" está vazio? ──
+        log('  · GATE 0: validando "GRUPO SEM LINHAS" vazio…');
+        const g0 = await gateDestinoVazio(sess);
+        if (!g0.ok) {
+          fail++;
+          log('  ⛔ GATE 0 falhou — ' + g0.motivo, 'err');
+          log('═══════ ⛔ INTERROMPIDO em "' + nome + '" — ' + ok + ' ok antes. Corrija e rode de novo. ═══════', 'err');
+          parou = true;
+          break;
+        }
+        if (g0.historicas > 0) log('    (' + g0.historicas + ' histórica[s] no destino — ignoradas)');
+        const destId = g0.destId, destName = g0.destName;
+
+        // ── Captura o conjunto esperado de MSISDNs da origem (pré-move) ──
+        const allPre = await loadViewUI(sess);
+        const origemPre = allPre.find(x => String(x.id) === String(gid));
+        if (!origemPre) { fail++; log('  ⛔ origem [' + gid + '] não encontrada no loadView', 'err'); parou = true; break; }
+        const ativasPre = activeLines(origemPre);
+        const N = ativasPre.length;
+        if (N === 0) {
+          log('  ↷ origem sem linhas ativas — pulando');
+          setProgresso(i + 1, total, 'Próximo…');
+          continue;
+        }
+        const msisdnsEsperados = new Set(ativasPre.map(msisdnOf).filter(Boolean));
+        if (msisdnsEsperados.size !== N) {
+          fail++;
+          log('  ⛔ origem tem ' + N + ' ativas mas só ' + msisdnsEsperados.size + ' MSISDNs únicos — não dá pra validar por identidade', 'err');
+          parou = true;
+          break;
+        }
+        log('  · ' + N + ' linha(s) esperada(s) · destino "' + destName + '" [' + destId + ']');
+
+        // ── MOVE via cliques ──
+        const r = await moverPorCliques(gid, nome, destId, destName);
+        if (!r.ok) {
+          fail++;
+          log('  ⛔ move falhou — ' + r.motivo, 'err');
+          log('═══════ ⛔ INTERROMPIDO — ' + ok + ' ok antes. ═══════', 'err');
+          parou = true;
+          break;
+        }
+        log('  ✓ move disparado — aguardando renomeio+cota…');
+
+        // ── Aguarda postMoveFlow (renomeio + cota) ──
+        const finalizou = await aguardarPostMove(90000);
+        if (!finalizou) {
+          fail++;
+          log('  ⛔ timeout no postMoveFlow (90s)', 'err');
+          log('═══════ ⛔ INTERROMPIDO — ' + ok + ' ok antes. ═══════', 'err');
+          parou = true;
+          break;
+        }
+
+        // ── GATE 1 (pós): valida que os N MSISDNs foram parar no destino
+        //    renomeado, e que o novo "GRUPO SEM LINHAS" está vazio ──
+        log('  · GATE 1: validando linhas no destino + novo vazio…');
+        const g1 = await gatePosMove(sess, msisdnsEsperados, N, nome);
+        if (!g1.ok) {
+          fail++;
+          log('  ⛔ GATE 1 falhou — ' + g1.motivo, 'err');
+          log('═══════ ⛔ INTERROMPIDO em "' + nome + '" — ' + ok + ' ok antes. Verifique manualmente antes de rodar de novo. ═══════', 'err');
+          parou = true;
+          break;
+        }
+        ok++;
+        log('  ✅ concluído · ' + N + ' linha(s) · GATE 1 ok', 'ok');
+      } catch (e) {
+        fail++;
+        log('  ⛔ erro inesperado: ' + (e && e.message || e), 'err');
+        parou = true;
+      }
+      setProgresso(i + 1, total, i + 1 === total ? 'Concluído.' : 'Próximo…');
+      fecharModais();
+      colapsarGrupos();
+      await sleep(1200);
+    }
+
+    log('═══════ fim · ' + ok + ' ok · ' + fail + ' falha' + (parou ? ' · INTERROMPIDO' : '') + ' ═══════', parou ? 'err' : 'hl');
+    setProgresso(total, total, parou ? 'Interrompido' : 'Concluído.');
+
+    // v9.6.0 — gravação final na planilha (sobrescreve o "Renovando...")
+    if (gravarLog && logConta && logAba) {
+      const dur         = durStr(Date.now() - tsInicio);
+      const statusFinal = (parou || fail > 0) ? 'Falha' : 'OK';
+      const obsFinal    = statusFinal + ': ' + ok + '/' + total + ' | ' + hhmm() + ' — duração (' + dur + ')';
+      gravarLogNaPlanilha(logConta, logAba, statusFinal, obsFinal)
+        .then(r => log(r && r.success ? '✓ planilha: resultado final registrado (' + statusFinal + ')' : '⚠ planilha (fim): ' + (r && r.error || 'falha'), r && r.success ? 'ok' : 'err'));
+    }
+
+    executando = false;
+    if (goBtn) { goBtn.disabled = false; goBtn.textContent = '▶ INICIAR'; }
+    tocarSomFim(!parou && fail === 0);
+  }
+
+  /* ─────────────────────────────────────────────────────────
+   *  CHAMADAS DE API (preservadas)
+   * ───────────────────────────────────────────────────────── */
   async function renameGroup(groupId, newName) {
     isOwnRequest = true;
     const base = {
@@ -448,23 +1138,20 @@
           }),
         }),
       ]);
-      // Lê ambos os bodies — o gate real é a confirmação do servidor
       const [jsonVoice, jsonData] = await Promise.all([
         resVoice.json().catch(() => ({})),
         resData.json().catch(() => ({})),
       ]);
-      // severity 'info' = sucesso confirmado pelo backend
       const ok = jsonData.severity === 'info' || jsonVoice.severity === 'info';
-      if (!ok) throw new Error(`renameGroup falhou: ${jsonData.severity || jsonVoice.severity || 'sem resposta'}`);
+      // v9.3.0 — log detalhado
+      log('  [DBG] renameGroup · id=' + groupId + ' → "' + newName + '" · voice.sev=' + (jsonVoice.severity || '?') + ' · data.sev=' + (jsonData.severity || '?'), 'dbg');
+      if (!ok) throw new Error(`renameGroup falhou: voice.sev=${jsonVoice.severity || 'x'} · data.sev=${jsonData.severity || 'x'}`);
       return true;
     } finally {
       isOwnRequest = false;
     }
   }
 
-  // Tenta atribuir cota ao grupo destino.
-  // Retorna { ok: true } se severity='info', { ok: false, json } caso contrário.
-  // NÃO lança erro — permite que o chamador decida o fallback.
   async function trySetGroupQuota(groupId, groupName, quotaValue) {
     isOwnRequest = true;
     const payload = {
@@ -493,27 +1180,36 @@
       });
       const json = await res.json().catch(() => ({}));
       const ok   = !json.severity || json.severity === 'info';
+      // v9.3.0 — log detalhado
+      log('  [DBG] setGroupQuota · id=' + groupId + ' · nome="' + groupName + '" · qty=' + quotaValue + 'GB · HTTP ' + res.status + ' · sev=' + (json.severity || '(none)') + (json.result ? ' · result=' + String(json.result).slice(0, 150) : ''), 'dbg');
       return { ok, json };
     } catch (err) {
+      log('  [DBG] setGroupQuota · exceção: ' + err.message, 'err');
       return { ok: false, json: { error: err.message } };
     } finally {
       isOwnRequest = false;
     }
   }
 
-  // Aplica cota individualmente em cada linha movida (action: saveLines)
   async function applyQuotaToLines(destGroupId, quotaPerLine, lines) {
     isOwnRequest = true;
     const defaultAccount = pendingMove.account || '';
 
-    const linesPayload = lines.map(line => ({
-      account:    line.account    || defaultAccount,
-      lineNumber: line.lineNumber || line.msisdn || line.numero || '',
-      userName:   line.userName   || line.name   || '',
-      quota:       { value: String(quotaPerLine), dataPackValueType: 'GB' },
-      futureQuota: { value: String(quotaPerLine), dataPackValueType: 'GB' },
-      notifyManagerGroup: false,
-    }));
+    // v9.6.0 — quotaPerLine === null → sinal de "uso livre" (payload sem quota/futureQuota)
+    const semCotaIndividual = (quotaPerLine === null || quotaPerLine === undefined);
+    const linesPayload = lines.map(line => {
+      const base = {
+        account:    line.account    || defaultAccount,
+        lineNumber: line.lineNumber || line.msisdn || line.numero || '',
+        userName:   line.userName   || line.name   || '',
+        notifyManagerGroup: false,
+      };
+      if (!semCotaIndividual) {
+        base.quota       = { value: String(quotaPerLine), dataPackValueType: 'GB' };
+        base.futureQuota = { value: String(quotaPerLine), dataPackValueType: 'GB' };
+      }
+      return base;
+    });
 
     const payload = {
       action:      'saveLines',
@@ -526,45 +1222,38 @@
     };
 
     try {
-      await fetch(`https://vivogestao.vivoempresas.com.br${CFG.API_PATH}`, {
+      const res = await fetch(`https://vivogestao.vivoempresas.com.br${CFG.API_PATH}`, {
         method: 'POST', credentials: 'include',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify(payload),
       });
+      const json = await res.json().catch(() => ({}));
+      const ok   = !json.severity || json.severity === 'info';
+      // v9.3.0 — log detalhado da response
+      log('  [DBG] saveLines · status=' + res.status + ' · sev=' + (json.severity || '(none)') + (json.result ? ' · result=' + String(json.result).slice(0, 150) : ''), 'dbg');
+      return { ok, json };
+    } catch (err) {
+      log('  [DBG] saveLines · exceção: ' + err.message, 'err');
+      return { ok: false, json: { error: err.message } };
     } finally {
       isOwnRequest = false;
     }
   }
 
-  /* ─────────────────────────────────────────────────────────
-   *  CLIQUE EM "CONSUMO DE DADOS"
-   *  Recarrega a view do portal para exibir os grupos já
-   *  renomeados. Chamado ao final do fluxo pós-movimentação.
-   *  Elemento: <a class="anchor-context">
-   *              <span class="icon-data-consumption-closed">
-   *            </span>Consumo de Dados</a>
-   * ───────────────────────────────────────────────────────── */
   function clickConsumoDados() {
     const span = document.querySelector('span.icon-data-consumption-closed');
     if (span) {
       const link = span.closest('a.anchor-context') || span.parentElement;
       if (link) { link.click(); return; }
     }
-    // Fallback: varre todos os anchor-context pelo texto
     document.querySelectorAll('a.anchor-context').forEach(a => {
       if (/consumo\s+de\s+dados/i.test(a.textContent)) a.click();
     });
   }
 
   /* ─────────────────────────────────────────────────────────
-   *  COLORAÇÃO — VERDE (ok) e VERMELHO (error)
-   *  Ambas persistem no localStorage com campo status.
-   *  Verde sobrescreve vermelho se o grupo for reprocessado.
+   *  COLORAÇÃO (preservada)
    * ───────────────────────────────────────────────────────── */
-
-  // Salva o resultado da operação no localStorage.
-  // status: 'ok' → verde | 'error' → vermelho
-  // Verde sobrescreve vermelho automaticamente ao reprocessar.
   function saveStatus(id, status) {
     try {
       const c = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
@@ -599,25 +1288,19 @@
     return false;
   }
 
-  // Tenta colorir imediatamente; se o DOM ainda não renderizou,
-  // usa MutationObserver com timeout de 8s
   function colorirComRetentativa(gId, timeoutMs = 8000) {
     if (colorirPorId(gId)) return;
-
     let done = false;
     const obs = new MutationObserver(() => {
       if (done) return;
       if (colorirPorId(gId)) { done = true; obs.disconnect(); clearTimeout(tOut); }
     });
     obs.observe(document.body, { childList: true, subtree: true });
-
     const tOut = setTimeout(() => {
       if (!done) { done = true; obs.disconnect(); restoreColors(); }
     }, timeoutMs);
   }
 
-  // Coloração vermelha — cota insuficiente.
-  // Persiste no localStorage via saveStatus(id, 'error').
   function colorirRowVermelho(row) {
     if (!row) return;
     row.dataset.ccOk = 'error';
@@ -639,22 +1322,17 @@
 
   function colorirVermelhoComRetentativa(gId, timeoutMs = 8000) {
     if (colorirVermelhoPorId(gId)) return;
-
     let done = false;
     const obs = new MutationObserver(() => {
       if (done) return;
       if (colorirVermelhoPorId(gId)) { done = true; obs.disconnect(); clearTimeout(tOut); }
     });
     obs.observe(document.body, { childList: true, subtree: true });
-
     const tOut = setTimeout(() => {
       if (!done) { done = true; obs.disconnect(); }
     }, timeoutMs);
   }
 
-  // Restaura cores a partir do localStorage (resiste a re-renders do Angular).
-  // Aplica verde (status 'ok') ou vermelho (status 'error') conforme salvo.
-  // Entradas sem campo status são tratadas como 'ok' (retrocompatibilidade).
   function restoreColors() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -676,10 +1354,10 @@
   }
 
   /* ─────────────────────────────────────────────────────────
-   *  INTERCEPTAÇÃO XHR
+   *  INTERCEPTAÇÃO XHR (v9.6.1 — via pageWindow/unsafeWindow)
    * ───────────────────────────────────────────────────────── */
-  const _XHR = window.XMLHttpRequest;
-  window.XMLHttpRequest = function () {
+  const _XHR = pageWindow.XMLHttpRequest;
+  pageWindow.XMLHttpRequest = function () {
     const xhr  = new _XHR();
     const self = this;
     let _method = '', _url = '';
@@ -691,13 +1369,11 @@
     };
 
     self.send = function (body) {
-      // Detecta moveLines para "GRUPO SEM LINHAS" (ignora nossas próprias requisições)
       if (!isOwnRequest && _method === 'POST' && _url.includes(CFG.API_PATH) && body) {
         try {
           const parsed = typeof body === 'string' ? JSON.parse(body) : body;
-          // Captura nome e cota da origem via body do listLines (request)
           if (parsed.action === 'listLines' && parsed.group?.id && parsed.group?.name) {
-            window.__moveGroupMap[String(parsed.group.id)] = { name: parsed.group.name };
+            pageWindow.__moveGroupMap[String(parsed.group.id)] = { name: parsed.group.name };
             saveQuotaCache(parsed.group.id, parsed.group.quota?.value, parsed.group.quotaConsume?.value);
           }
           if (isTargetMove(parsed)) handleMoveLines(parsed);
@@ -707,7 +1383,7 @@
       xhr.addEventListener('load', () => {
         captureGroupMap(xhr.responseText || '');
         if (_method === 'GET' && _url.includes(CFG.API_PATH) && _url.includes('loadView')) {
-          window.__loadViewListeners.slice().forEach(fn => { try { fn(); } catch (_) {} });
+          pageWindow.__loadViewListeners.slice().forEach(fn => { try { fn(); } catch (_) {} });
         }
       });
 
@@ -731,20 +1407,18 @@
   };
 
   /* ─────────────────────────────────────────────────────────
-   *  INTERCEPTAÇÃO fetch
+   *  INTERCEPTAÇÃO fetch (v9.6.1 — via pageWindow/unsafeWindow)
    * ───────────────────────────────────────────────────────── */
-  const _fetch = window.fetch.bind(window);
-  window.fetch = async function (input, init = {}) {
+  const _fetch = pageWindow.fetch.bind(pageWindow);
+  pageWindow.fetch = async function (input, init = {}) {
     const url    = typeof input === 'string' ? input : (input?.url || '');
     const method = (init.method || (typeof input === 'object' ? input.method : '') || 'GET').toUpperCase();
 
-    // Detecta moveLines para "GRUPO SEM LINHAS" (ignora nossas próprias requisições)
     if (!isOwnRequest && method === 'POST' && url.includes(CFG.API_PATH) && init.body) {
       try {
         const parsed = typeof init.body === 'string' ? JSON.parse(init.body) : init.body;
-        // Captura nome e cota da origem via body do listLines (request)
         if (parsed.action === 'listLines' && parsed.group?.id && parsed.group?.name) {
-          window.__moveGroupMap[String(parsed.group.id)] = { name: parsed.group.name };
+          pageWindow.__moveGroupMap[String(parsed.group.id)] = { name: parsed.group.name };
           saveQuotaCache(parsed.group.id, parsed.group.quota?.value, parsed.group.quotaConsume?.value);
         }
         if (isTargetMove(parsed)) handleMoveLines(parsed);
@@ -757,7 +1431,7 @@
       response.clone().text().then(t => {
         captureGroupMap(t);
         if (method === 'GET' && url.includes('loadView')) {
-          window.__loadViewListeners.slice().forEach(fn => { try { fn(); } catch (_) {} });
+          pageWindow.__loadViewListeners.slice().forEach(fn => { try { fn(); } catch (_) {} });
         }
       }).catch(() => {});
     }
@@ -766,49 +1440,38 @@
   };
 
   /* ─────────────────────────────────────────────────────────
-   *  OBSERVER ANGULAR
-   *  — Restaura cores a cada re-render
-   *  — FIX: observa o modal <moveconsume> para mapear
-   *    id → nome dos grupos destino via DOM dos radio buttons
-   *    (necessário pois o payload moveLines só envia o id,
-   *     nunca o nome do grupo destino)
+   *  OBSERVER ANGULAR (preservado)
    * ───────────────────────────────────────────────────────── */
   function observeAngular() {
     const obs = new MutationObserver(() => {
-      restoreColors();
+      if (isCfg('colorir')) restoreColors();
 
-      // Captura nomes dos grupos do modal de movimentação
       const mc = document.querySelector('moveconsume');
       if (!mc) return;
 
       mc.querySelectorAll('input[type="radio"][id^="rdgroup"]').forEach(radio => {
         const gId   = radio.id.replace('rdgroup', '');
         const label = mc.querySelector(`label[for="${radio.id}"]`);
-        // Remove badge "⚡ ..." que o script de badge pode ter adicionado
         const name  = label ? label.textContent.replace(/⚡.*$/, '').trim() : '';
         if (gId && name) {
-          window.__moveGroupMap[gId] = { name };
+          pageWindow.__moveGroupMap[gId] = { name };
         }
       });
     });
     obs.observe(document.body, { childList: true, subtree: true });
   }
 
-  /* ─────────────────────────────────────────────────────────
-   *  DETECÇÃO DE LOGOUT / SESSÃO EXPIRADA
-   *  Limpa o mapa de grupos para evitar nomes desatualizados
-   * ───────────────────────────────────────────────────────── */
   function setupLogoutDetection() {
     const obs = new MutationObserver(mutations => {
       for (const m of mutations) {
         for (const node of m.addedNodes) {
           if (node.nodeType !== 1) continue;
           if (/sessão expirou|session expired|sessão expirada/i.test(node.textContent || ''))
-            window.__moveGroupMap = {};
+            pageWindow.__moveGroupMap = {};
           const btn = node.querySelector?.('[href*="logout"],[href*="sair"],[onclick*="logout"]');
           if (btn && !btn._vgLogout) {
             btn._vgLogout = true;
-            btn.addEventListener('click', () => { window.__moveGroupMap = {}; }, true);
+            btn.addEventListener('click', () => { pageWindow.__moveGroupMap = {}; }, true);
           }
         }
       }
@@ -821,9 +1484,251 @@
       if (cur !== _lastUrl) {
         _lastUrl = cur;
         if (/login|logout|sign.*out|session.*expired|acesso/i.test(cur))
-          window.__moveGroupMap = {};
+          pageWindow.__moveGroupMap = {};
       }
     }, 2000);
+  }
+
+  /* ─────────────────────────────────────────────────────────
+   *  v9.0.0 — UI SIDEBAR (esquerda · padrão ConectaChip)
+   * ───────────────────────────────────────────────────────── */
+  const CC_LARGURA = 340;
+  const CSS = `
+    /* Paleta ConectaChip · espelhada à ESQUERDA (evita colidir com vivo-renova à direita) */
+    body.mlq-aberto { margin-left: ${CC_LARGURA}px !important; transition: margin-left .3s ease; }
+
+    /* Tab de restaurar (esquerda) — padrão ui2ui (compacto · seta acima · texto vertical) */
+    #mlq-tab { position: fixed; top: 50%; left: 0; transform: translateY(-50%); z-index: 2147483640;
+      background: #2157d9; color: #fff; border: none; border-radius: 0 10px 10px 0;
+      padding: 14px 8px; cursor: pointer; box-shadow: 2px 0 10px rgba(0,0,0,.2);
+      font: 700 11px/1 -apple-system, Segoe UI, Roboto, sans-serif;
+      writing-mode: vertical-rl; display: none;
+    }
+    body:not(.mlq-aberto) #mlq-tab { display: inline-block; }
+    #mlq-tab:hover { background: #1A46B0; }
+
+    #mlq-panel { position: fixed; top: 0; left: 0; width: ${CC_LARGURA}px; height: 100vh; z-index: 2147483641;
+      background: #FAFAFA; border-right: 1px solid #E5E7EB; box-shadow: 6px 0 24px rgba(0,0,0,.08);
+      display: flex; flex-direction: column;
+      font: 13px/1.45 -apple-system, "Segoe UI", Roboto, "Inter", sans-serif; color: #111827;
+      transition: transform .3s ease;
+    }
+    body:not(.mlq-aberto) #mlq-panel { transform: translateX(-100%); }
+    #mlq-panel * { box-sizing: border-box; }
+
+    #mlq-hd { padding: 14px 16px 12px; background: #2157d9; color: #fff; position: relative; flex-shrink: 0; }
+    #mlq-hd h3 { margin: 0; font-size: 14px; font-weight: 700; letter-spacing: .2px; }
+    #mlq-hd .sub { font-size: 11px; opacity: .88; margin-top: 3px; }
+    #mlq-close { position: absolute; top: 10px; right: 12px; background: rgba(255,255,255,.15); border: none;
+      color: #fff; width: 26px; height: 26px; border-radius: 6px; cursor: pointer; font-size: 15px; line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #mlq-close:hover { background: rgba(255,255,255,.28); }
+
+    #mlq-cfg { display: flex; flex-direction: column; gap: 8px; padding: 14px 16px 6px; font-size: 12.5px; flex-shrink: 0;
+      background: #fff; border-bottom: 1px solid #E5E7EB;
+    }
+    #mlq-cfg label.cb { display: flex; align-items: center; gap: 10px; color: #374151; cursor: pointer; user-select: none; }
+    #mlq-cfg label.cb input[type=checkbox] {
+      -webkit-appearance: checkbox !important; -moz-appearance: checkbox !important; appearance: checkbox !important;
+      width: 16px !important; height: 16px !important;
+      opacity: 1 !important; visibility: visible !important; display: inline-block !important;
+      position: static !important; pointer-events: auto !important;
+      accent-color: #2157d9; cursor: pointer; flex-shrink: 0; margin: 0;
+    }
+    #mlq-cfg label.cb span.txt { flex: 1; font-weight: 500; color: #111827; }
+    #mlq-cfg .hint { width: 20px; height: 20px; line-height: 20px; text-align: center; border-radius: 50%;
+      background: #DBE7FB; color: #1A46B0; font-size: 11px; font-weight: 700; cursor: pointer; flex-shrink: 0;
+      user-select: none; transition: background .15s;
+    }
+    #mlq-cfg .hint:hover { background: #2157d9; color: #fff; }
+
+    #mlq-tooltip { position: fixed; z-index: 2147483645; max-width: 280px; padding: 10px 12px;
+      background: #111827; color: #F9FAFB; font-size: 11.5px; line-height: 1.45; border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.25); display: none; pointer-events: none;
+    }
+    #mlq-tooltip.show { display: block; }
+
+    #mlq-status { padding: 10px 16px; background: #fff; border-bottom: 1px solid #F3F4F6; flex-shrink: 0; }
+    .mlq-st-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11.5px; color: #6B7280; }
+    .mlq-st-head b { color: #111827; font-weight: 700; }
+    .mlq-st-msg { font-size: 12px; color: #111827; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mlq-st-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #6B7280; margin-right: 6px; vertical-align: middle; }
+    .mlq-st-dot.on { background: #16A34A; animation: mlq-pulse 1.5s infinite; }
+    @keyframes mlq-pulse { 50% { opacity: .35; } }
+
+    /* v9.1.0 — tools + lista de grupos + progresso + botão INICIAR */
+    #mlq-tools { display: flex; align-items: center; gap: 10px; padding: 8px 16px 4px; font-size: 12px; color: #6B7280; flex-shrink: 0; background: #fff; }
+    #mlq-tools a { color: #2157d9; cursor: pointer; font-weight: 600; text-decoration: none; }
+    #mlq-tools a:hover { text-decoration: underline; }
+    #mlq-list { margin: 0 12px 8px; flex: 0 0 auto; max-height: 28vh; overflow: auto; border: 1px solid #E5E7EB; border-radius: 10px; background: #fff; }
+    .mlq-g { display: flex; align-items: center; gap: 9px; padding: 9px 10px; border-bottom: 1px solid #F3F4F6; cursor: pointer; }
+    .mlq-g:last-child { border-bottom: none; }
+    .mlq-g:hover { background: #F9FAFB; }
+    .mlq-cb { width: 16px; height: 16px; flex: 0 0 auto; cursor: pointer;
+      -webkit-appearance: checkbox !important; appearance: auto !important; opacity: 1 !important;
+      position: static !important; margin: 0; accent-color: #2157d9;
+    }
+    .mlq-g .nm { flex: 1; font-weight: 600; font-size: 12px; color: #111827; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mlq-g .id { font: 600 10.5px/1 ui-monospace, monospace; background: #DBE7FB; color: #1A46B0; border-radius: 5px; padding: 3px 6px; flex-shrink: 0; }
+    .mlq-g .ct { font-size: 11px; color: #6B7280; min-width: 62px; text-align: right; flex-shrink: 0; }
+
+    #mlq-progress { padding: 10px 16px; background: #fff; border-top: 1px solid #E5E7EB; flex-shrink: 0; }
+    #mlq-progress.hidden { display: none; }
+    .mlq-pg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11.5px; color: #6B7280; }
+    .mlq-pg-head b { color: #111827; font-weight: 700; }
+    .mlq-pg-atual { font-size: 12px; color: #111827; font-weight: 600; margin-bottom: 6px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .mlq-pg-bar { height: 8px; background: #DBE7FB; border-radius: 999px; overflow: hidden; }
+    .mlq-pg-fill { height: 100%; background: #2157d9; transition: width .4s ease; border-radius: 999px; width: 0%; }
+
+    #mlq-actions { padding: 8px 12px; display: flex; gap: 6px; flex-shrink: 0; background: #fff; border-top: 1px solid #F3F4F6; border-bottom: 1px solid #F3F4F6; }
+    #mlq-go { flex: 1; background: #2157d9; color: #fff; border: none; border-radius: 8px; padding: 10px;
+      font-weight: 700; font-size: 12.5px; cursor: pointer; transition: background .15s;
+    }
+    #mlq-go:hover:not(:disabled) { background: #1A46B0; }
+    #mlq-go:disabled { background: #9CA3AF; cursor: not-allowed; }
+    #mlq-reload, #mlq-clear, #mlq-copy { background: #F3F4F6; color: #374151; border: 1px solid #E5E7EB; border-radius: 8px;
+      padding: 8px 10px; font-weight: 600; font-size: 11.5px; cursor: pointer; transition: background .15s;
+    }
+    #mlq-reload:hover, #mlq-clear:hover, #mlq-copy:hover { background: #E5E7EB; }
+
+    #mlq-log { flex: 0 0 auto; height: 180px; margin: 8px 12px 12px; padding: 10px; background: #0F172A; color: #E5E7EB;
+      border-radius: 10px; overflow: auto; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+    }
+    #mlq-log .ok  { color: #4ADE80; }
+    #mlq-log .err { color: #F87171; }
+    #mlq-log .hl  { color: #60A5FA; font-weight: 700; }
+    #mlq-log .dbg { color: #94A3B8; font-style: italic; }
+  `;
+
+  function atualizarStatusUI(msg) {
+    const el = document.getElementById('mlq-status-msg');
+    const dot = document.getElementById('mlq-status-dot');
+    if (el) el.textContent = msg || 'Aguardando movimento…';
+    if (dot) dot.classList.toggle('on', /aguardando/i.test(msg || '') === false);
+  }
+
+  function mount() {
+    if (document.getElementById('mlq-panel')) return;
+    if (!document.body) { window.addEventListener('DOMContentLoaded', mount); return; }
+
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    document.head.appendChild(style);
+
+    // Tooltip flutuante
+    const tt = document.createElement('div');
+    tt.id = 'mlq-tooltip';
+    document.body.appendChild(tt);
+
+    // Tab lateral (só aparece quando ocultado) — v9.3.0 padrão ui2ui (compacta, seta+texto verticais)
+    const tab = document.createElement('button');
+    tab.id = 'mlq-tab';
+    tab.title = 'Abrir MoveLines + Cota';
+    tab.textContent = '▶ MoveLines + Cota';
+    document.body.appendChild(tab);
+
+    // Sidebar
+    const panel = document.createElement('div');
+    panel.id = 'mlq-panel';
+    let cfgHtml = '';
+    for (const [k, v] of Object.entries(CFG_UI)) {
+      const checked = cfgUI[k] ? 'checked' : '';
+      cfgHtml += `<label class="cb"><input type="checkbox" data-cfg="${k}" ${checked}><span class="txt">${v.label}</span><span class="hint" data-tip="${k}">?</span></label>`;
+    }
+    panel.innerHTML = `
+      <div id="mlq-hd">
+        <button id="mlq-close" title="Ocultar">×</button>
+        <h3>MoveLines + Cota</h3>
+        <div class="sub">Move → "GRUPO SEM LINHAS" → renomeia + cota</div>
+      </div>
+      <div id="mlq-cfg">${cfgHtml}</div>
+      <div id="mlq-tools"><span>Marcar:</span><a id="mlq-all">todos</a><a id="mlq-none">nenhum</a><a id="mlq-reload-link" style="margin-left:auto">↻ lista</a></div>
+      <div id="mlq-list"></div>
+      <div id="mlq-status">
+        <div class="mlq-st-head"><span>Status</span><span><span id="mlq-status-dot" class="mlq-st-dot on"></span><span id="mlq-log-count">0</span> log(s)</span></div>
+        <div class="mlq-st-msg" id="mlq-status-msg">Aguardando movimento…</div>
+      </div>
+      <div id="mlq-progress" class="hidden">
+        <div class="mlq-pg-head"><span>Progresso</span><span class="mlq-pg-count"><b>0</b>/<span class="mlq-pg-total">0</span> · <span class="mlq-pg-pct">0%</span></span></div>
+        <div class="mlq-pg-atual">Aguardando…</div>
+        <div class="mlq-pg-bar"><div class="mlq-pg-fill"></div></div>
+      </div>
+      <div id="mlq-actions">
+        <button id="mlq-go" title="Iniciar automação em lote">▶ INICIAR</button>
+        <button id="mlq-clear" title="Limpar log">🗑</button>
+        <button id="mlq-copy" title="Copiar log">📋</button>
+      </div>
+      <div id="mlq-log"></div>
+    `;
+    document.body.appendChild(panel);
+    // v9.2.0 — inicia RECOLHIDO; só expande ao clicar na tab lateral
+
+    const logBox = panel.querySelector('#mlq-log');
+    const countEl = panel.querySelector('#mlq-log-count');
+
+    // Registra fn de log da UI e despeja buffer
+    uiLogFn = (linha, cls) => {
+      const div = document.createElement('div');
+      if (cls) div.className = cls;
+      div.textContent = linha;
+      logBox.appendChild(div);
+      logBox.scrollTop = logBox.scrollHeight;
+      if (countEl) countEl.textContent = logBox.children.length;
+    };
+    // Despeja o buffer de logs anteriores
+    logBuffer.forEach(({ msg, cls }) => uiLogFn(msg, cls));
+
+    // Handlers
+    const listEl = panel.querySelector('#mlq-list');
+    panel.querySelector('#mlq-close').onclick = () => document.body.classList.remove('mlq-aberto');
+    tab.onclick = () => document.body.classList.add('mlq-aberto');
+    panel.querySelector('#mlq-clear').onclick = () => { logBox.innerHTML = ''; logBuffer.length = 0; if (countEl) countEl.textContent = '0'; };
+    panel.querySelector('#mlq-copy').onclick = () => {
+      const txt = logBuffer.map(l => l.msg).join('\n');
+      navigator.clipboard.writeText(txt).then(() => log('(log copiado)', 'ok')).catch(() => log('não consegui copiar', 'err'));
+    };
+    // v9.1.0 — lista de grupos + botão INICIAR + marcar todos/nenhum + recarregar
+    panel.querySelector('#mlq-all').onclick    = () => qsa('#mlq-list .mlq-cb').forEach(c => c.checked = true);
+    panel.querySelector('#mlq-none').onclick   = () => qsa('#mlq-list .mlq-cb').forEach(c => c.checked = false);
+    panel.querySelector('#mlq-reload-link').onclick = () => { if (!executando) montarLista(listEl); };
+    panel.querySelector('#mlq-go').onclick     = () => executarLote();
+    // Carrega lista com pequeno delay pra dar tempo do portal capturar sessão
+    setTimeout(() => montarLista(listEl), 1200);
+
+    // Checkboxes
+    panel.querySelectorAll('input[data-cfg]').forEach(inp => {
+      inp.addEventListener('change', () => {
+        const k = inp.dataset.cfg;
+        setCfg(k, inp.checked);
+        log((inp.checked ? '✓ ' : '⏭ ') + CFG_UI[k].label + ': ' + (inp.checked ? 'ON' : 'OFF'), 'hl');
+      });
+    });
+
+    // Tooltips (click + hover)
+    panel.querySelectorAll('.hint').forEach(h => {
+      const mostrar = () => {
+        const k = h.dataset.tip;
+        const txt = CFG_UI[k]?.tip || '';
+        if (!txt) return;
+        tt.textContent = txt;
+        tt.classList.add('show');
+        const r = h.getBoundingClientRect();
+        const ttW = 280;
+        let left = Math.max(8, Math.min(window.innerWidth - ttW - 8, r.left + r.width / 2 - ttW / 2));
+        let top  = r.top - tt.offsetHeight - 10;
+        if (top < 8) top = r.bottom + 10;
+        tt.style.left = left + 'px';
+        tt.style.top  = top + 'px';
+      };
+      const esconder = () => tt.classList.remove('show');
+      h.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); tt.classList.contains('show') ? esconder() : mostrar(); });
+      h.addEventListener('mouseenter', mostrar);
+      h.addEventListener('mouseleave', esconder);
+    });
+    document.addEventListener('click', (e) => { if (!e.target.closest('.hint') && !e.target.closest('#mlq-tooltip')) tt.classList.remove('show'); });
   }
 
   /* ─────────────────────────────────────────────────────────
@@ -832,12 +1737,10 @@
   function init() {
     setupLogoutDetection();
     observeAngular();
-    setTimeout(restoreColors, 300);
-    setInterval(restoreColors, 1500);
-    console.warn(
-      '%c[VG Auto] ✅ v8.14.0 — reload após cota | log narrativo | código limpo',
-      'color:#22c55e;font-weight:bold;'
-    );
+    setTimeout(() => { if (isCfg('colorir')) restoreColors(); }, 300);
+    setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
+    mount();
+    log('✅ MoveLines + Cota v9.0.0 carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
