@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.6.2
+// @version      9.7.0
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,55 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.7.0 — Herança 3-em-3 (grupos NORMAIS)
+─────────────────────────────────────────────────────────────
+Análise multi-agente (9 agentes) escolheu esta arquitetura:
+o destino HERDA nome + cota do grupo + linhas do origem, com
+cota por linha = min(nominal_do_nome, floor(cotaGrupo/N)).
+Grupos ILIMITADOS mantêm o fluxo v9.6.2 (branch separado).
+
+1. NOVA ORDEM DE EXECUÇÃO (postMoveFlow, caminho NORMAL→NORMAL)
+   0. Congela originTotalFrozen em const (blinda contra refetch)
+   1. moveLines (UI dispara)
+   2. waitForLoadViewBurst (já existia)
+   3. setGroupQuota(dest, originTotalFrozen)   ← R2 (herda cota)
+   4. ⭐ Micro-gate: refetch dest.total == originTotalFrozen (3×)
+   5. applyQuotaToLines(dest, perLine)          ← R3 (CAP igualitário)
+   6. renameGroup(dest, sourceName)             ← R1 (herda nome)
+   7. setGroupQuota(source, 0)                  ← RESET só agora
+   8. ⭐ Micro-gate: refetch source.total == 0 (3×)
+   9. renameGroup(source, 'GRUPO SEM LINHAS')
+   10. Colorir + reload + reset
+
+2. MICRO-GATES · refetchGroupTotal(id, expected, {attempts:3, sleepMs:500})
+   Motivo: Vivo POST retorna 200 mas propaga async. Sem revalidação,
+   race entre POSTs sequenciais podia fazer applyQuotaToLines rodar
+   numa cotaGrupo ainda antiga (HTTP 500 sub-reportado como sucesso).
+
+3. R3 · Distribuição CAP (min do nominal com igualitário)
+   perLine = min(extractQuota(nome), floor((cotaGrupo/N) × 100) / 100)
+   • Undersubscrição (5 linhas / 80GB / '10GB'): 10 GB (respeita nome)
+   • Oversubscrição (16 linhas / 80GB / '10GB'): 5 GB (igualitário)
+   • Nome sem GB: floor(cotaGrupo/N) puro
+   Decisão do Naldo: CAP > Igualitária estrita (não surpreender cliente).
+
+4. GATE DE ATIVAÇÃO da herança
+   if (origem.ilimitado || destino.ilimitado) → v9.6.2 legado
+   else → herança 3-em-3 (força mesmo com cota destino diferente)
+   Decisão do Naldo: match parcial força herança usando origem como
+   fonte-de-verdade — mais previsível que abortar.
+
+5. LOG EXPANDIDO NO GATE 1 · também no sucesso
+   Antes: "✅ concluído · 16 linha(s) · GATE 1 ok"
+   Agora: "✅ concluído · destino=16/16 · faltam 0 · extras 0 · historicas 6"
+   Motivo: divergência de contagem que Naldo relatou → precisa distinguir
+   ativas vs históricas no log ANTES de instrumentação pesada.
+
+6. SUFIXO TIMESTAMP em GRUPO SEM LINHAS · NÃO IMPLEMENTADO
+   A análise sugeriu, mas GATE 0 rejeita se acha >1 grupo casando a regex
+   TARGET_DEST_PATTERN — e um sufixo variável quebraria a unicidade em
+   batches longos. Mantido "GRUPO SEM LINHAS" puro.
+
 CHANGELOG v9.6.2
 ─────────────────────────────────────────────────────────────
 1. FIX HTTP 500 · CAP cota individual pra caber no grupo
@@ -436,6 +485,24 @@ CHANGELOG v9.0.0
     finally { isOwnRequest = false; }
   }
 
+  /* v9.7.0 — Refetch da cota TOTAL do grupo com validação vs expected.
+     Vivo retorna 200 mas propaga async: refazer POST getGroupMoveLines
+     e verificar se cache.total == expected (tolerância 0.01 GB).
+     Retorna { ok, total, tentativas }. */
+  async function refetchGroupTotal(groupId, expectedGB, opts = {}) {
+    const attempts = opts.attempts || 3;
+    const sleepMs  = opts.sleepMs  || 500;
+    let ultimoTotal = 0;
+    for (let i = 0; i < attempts; i++) {
+      await sleep(sleepMs);
+      await fetchDestGroupQuota(groupId);
+      const cache = groupQuotaCache[String(groupId)] || {};
+      ultimoTotal = parseFloat(cache.total) || 0;
+      if (Math.abs(ultimoTotal - expectedGB) < 0.01) return { ok: true, total: ultimoTotal, tentativas: i + 1 };
+    }
+    return { ok: false, total: ultimoTotal, esperado: expectedGB, tentativas: attempts };
+  }
+
   function findGdGroup(excludeIds = []) {
     for (const [id, entry] of Object.entries(pageWindow.__moveGroupMap)) {
       if (excludeIds.includes(id)) continue;
@@ -516,19 +583,139 @@ CHANGELOG v9.0.0
   }
 
   /* ─────────────────────────────────────────────────────────
-   *  FLUXO PÓS-MOVIMENTAÇÃO — v9.4.0
-   *  Novo modelo: cota TRANSFERIDA direto origem→destino (sem GD).
-   *  Ordem: capturar cota origem → RESET origem (0 GB) → renomeios →
-   *  setar cota destino = cota origem → aplicar cota individual nas linhas.
-   *  Grupos ilimitados: se checkbox "aplicar em ilimitados" OFF, pula tudo.
+   *  FLUXO PÓS-MOVIMENTAÇÃO — v9.7.0
+   *  Dois branches:
+   *   • NORMAL → NORMAL: HERANÇA 3-em-3 (nome + cota + linhas)
+   *     Ordem: setQuotaDest → gate → applyLines → renameDest →
+   *            resetOrigem → gate → renameOrigem
+   *   • Qualquer lado ILIMITADO: fluxo legado v9.6.2 (transferência 1:1
+   *     com RESET-first, ou cota do GD se destino é ilimitado)
    * ───────────────────────────────────────────────────────── */
   async function postMoveFlow() {
     const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
     log('  [DBG] postMoveFlow · sourceGroupId=' + sourceGroupId + ' · sourceGroupName="' + sourceGroupName + '" · destGroupId=' + destGroupId + ' · lines=' + lines.length, 'dbg');
 
-    // ── Detecta se o grupo é ilimitado ─────────────────────
-    const ilim = isIlimitado(sourceGroupName);
-    if (ilim) log('  · grupo ILIMITADO detectado · cota destino virá do GD · cota individual das linhas: ' + (isCfg('ilim') ? 'SIM' : 'NÃO (checkbox)'));
+    const origemIlim = isIlimitado(sourceGroupName);
+    const destinoName = (pageWindow.__moveGroupMap[String(destGroupId)] || {}).name || '';
+    const destIlim = isIlimitado(destinoName);
+
+    if (origemIlim || destIlim) {
+      log('  · rota ILIMITADO detectada (origem_ilim=' + origemIlim + ' · destino_ilim=' + destIlim + ') → fluxo v9.6.2 legado');
+      await postMoveFlowLegado(origemIlim);
+    } else {
+      log('  · rota NORMAL→NORMAL → herança 3-em-3');
+      await postMoveFlowHeranca();
+    }
+  }
+
+  /* v9.7.0 — HERANÇA 3-em-3 (só grupos NORMAIS) */
+  async function postMoveFlowHeranca() {
+    const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
+    let cotaSuficiente = true;
+
+    // ── ETAPA 0: congela originTotalFrozen ANTES de qualquer escrita ──
+    await fetchDestGroupQuota(destGroupId); // refresh cache dest
+    const destCache = groupQuotaCache[String(destGroupId)] || {};
+    const destTotalPre = parseFloat(destCache.total) || 0;
+    const cacheOrigem = groupQuotaCache[String(sourceGroupId)] || {};
+    const originTotalFrozen = parseFloat(cacheOrigem.total) || getAvailableQuota(sourceGroupId) || 0;
+    log('  [DBG] herança · originTotalFrozen=' + originTotalFrozen.toFixed(2) + ' GB · destTotalPre=' + destTotalPre.toFixed(2) + ' GB · linhas=' + lines.length, 'dbg');
+
+    if (originTotalFrozen <= 0) {
+      log('  ⚠ originTotalFrozen=0 — origem sem cota registrada, herança abortada', 'err');
+      cotaSuficiente = false;
+      finalizarPostMove(cotaSuficiente);
+      return;
+    }
+
+    // ── R3: cota por linha = min(nominal, floor(originTotal/N)) ──
+    let perLine = null;
+    if (lines.length > 0) {
+      const nominal = extractQuotaFromGroupName(sourceGroupName) || 0;
+      const capMax  = Math.floor((originTotalFrozen / lines.length) * 100) / 100;
+      perLine = nominal > 0 ? Math.min(nominal, capMax) : capMax;
+      if (nominal > 0 && nominal > capMax) {
+        log('  ⚠ nominal ' + nominal + 'GB × ' + lines.length + ' = ' + (nominal * lines.length).toFixed(2) + 'GB > grupo ' + originTotalFrozen.toFixed(2) + 'GB · CAP → ' + perLine + 'GB/linha', 'hl');
+      } else {
+        log('  · perLine = ' + perLine + ' GB (nominal=' + nominal + ' · cap=' + capMax + ')');
+      }
+    }
+
+    // ── ETAPA 3: setGroupQuota(dest, originTotalFrozen) [R2] ──
+    if (isCfg('aplicarCota')) {
+      atualizarStatusUI('Aplicando cota herdada no destino…');
+      log('  · aplicando ' + originTotalFrozen.toFixed(2) + ' GB no destino [' + destGroupId + ']… [R2]');
+      const r = await trySetGroupQuota(destGroupId, sourceGroupName, originTotalFrozen);
+      if (!r.ok) {
+        log('  ⚠ trySetGroupQuota destino FALHOU · sev=' + (r.json?.severity || '?') + ' · result=' + (r.json?.result || ''), 'err');
+        cotaSuficiente = false;
+        finalizarPostMove(cotaSuficiente);
+        return;
+      }
+      log('  ✓ cota do grupo aplicada · sev=' + (r.json?.severity || 'ok'), 'ok');
+
+      // ── ETAPA 4: micro-gate refetch dest.total ──
+      const g = await refetchGroupTotal(destGroupId, originTotalFrozen);
+      if (!g.ok) {
+        log('  ⚠ micro-gate DEST falhou · esperado=' + originTotalFrozen.toFixed(2) + ' visto=' + g.total.toFixed(2) + ' após ' + g.tentativas + ' tentativas — propagação async não confirmada', 'err');
+        cotaSuficiente = false;
+        // Segue mesmo assim pra tentar aplicar cotas nas linhas (Vivo às vezes propaga tardio)
+      } else {
+        log('  ✓ micro-gate DEST ok · total=' + g.total.toFixed(2) + 'GB · tentativas=' + g.tentativas, 'ok');
+      }
+    }
+
+    // ── ETAPA 5: applyQuotaToLines [R3] ──
+    if (isCfg('aplicarCota') && lines.length > 0 && perLine !== null) {
+      log('  · applyQuotaToLines · ' + lines.length + ' linha(s) · ' + perLine + ' GB por linha… [R3]');
+      const rl = await applyQuotaToLines(destGroupId, perLine, lines);
+      if (rl.ok) log('  ✓ cota individual aplicada', 'ok');
+      else       { log('  ⚠ applyQuotaToLines FALHOU · sev=' + (rl.json?.severity || '?') + ' · result=' + (rl.json?.result || ''), 'err'); cotaSuficiente = false; }
+    }
+
+    // ── ETAPA 6: renameGroup(dest, sourceName) [R1] ──
+    if (isCfg('renomear')) {
+      try {
+        atualizarStatusUI('Renomeando destino → "' + sourceGroupName + '"…');
+        log('  · renomeando destino [' + destGroupId + '] → "' + sourceGroupName + '" [R1]');
+        await renameGroup(destGroupId, sourceGroupName);
+        log('  ✓ destino renomeado', 'ok');
+      } catch (err) { log('  ⚠ renomeio destino falhou: ' + err.message, 'err'); }
+    }
+
+    // ── ETAPA 7: setGroupQuota(source, 0) — RESET agora ──
+    if (isCfg('aplicarCota')) {
+      atualizarStatusUI('Zerando cota da origem…');
+      log('  · RESET · zerando cota da origem [' + sourceGroupId + '] (libera ' + originTotalFrozen.toFixed(2) + ' GB)…');
+      const rz = await trySetGroupQuota(sourceGroupId, sourceGroupName, 0);
+      if (rz.ok) {
+        log('  ✓ cota da origem zerada', 'ok');
+        // ── ETAPA 8: micro-gate refetch source.total ──
+        const g = await refetchGroupTotal(sourceGroupId, 0);
+        if (!g.ok) log('  ⚠ micro-gate ORIGEM falhou · esperado=0 visto=' + g.total.toFixed(2) + ' após ' + g.tentativas + ' tentativas — pool GD pode estar inflado', 'err');
+        else       log('  ✓ micro-gate ORIGEM ok · total=' + g.total.toFixed(2) + 'GB · tentativas=' + g.tentativas, 'ok');
+      } else {
+        log('  ⚠ RESET falhou · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || ''), 'err');
+      }
+    }
+
+    // ── ETAPA 9: renameGroup(source, EMPTY_NAME) ──
+    if (isCfg('renomear')) {
+      try {
+        atualizarStatusUI('Renomeando origem → "GRUPO SEM LINHAS"…');
+        log('  · renomeando origem [' + sourceGroupId + '] → "GRUPO SEM LINHAS"');
+        await renameGroup(sourceGroupId, CFG.EMPTY_NAME);
+        log('  ✓ origem renomeada', 'ok');
+      } catch (err) { log('  ⚠ renomeio origem falhou: ' + err.message, 'err'); }
+    }
+
+    log('  ✅ herança concluída · ' + sourceGroupName + ' · grupo=' + originTotalFrozen.toFixed(2) + 'GB · ' + lines.length + '× ' + perLine + 'GB', 'ok');
+    finalizarPostMove(cotaSuficiente);
+  }
+
+  /* v9.6.2 preservado (branch ILIMITADO): RESET-first, cota via GD ou origem */
+  async function postMoveFlowLegado(ilim) {
+    const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
 
     // ── ETAPA 0: captura cotas atuais (destino + origem) ──
     const destAvail   = await fetchDestGroupQuota(destGroupId) || getAvailableQuota(destGroupId);
@@ -536,76 +723,53 @@ CHANGELOG v9.0.0
     const originTotal = parseFloat(cacheOrigem.total) || getAvailableQuota(sourceGroupId) || 0;
     log('  [DBG] cotas capturadas · destino_avail=' + destAvail.toFixed(2) + ' GB · origem_TOTAL=' + originTotal.toFixed(2) + ' GB', 'dbg');
 
-    // ── ETAPA 1a: RESET cota da origem — SEMPRE (o "grupo sem linhas" fica zerado) ──
+    // ── ETAPA 1a: RESET cota da origem ──
     if (isCfg('aplicarCota') && originTotal > 0) {
       atualizarStatusUI('Zerando cota da origem…');
       log('  · RESET · zerando cota da origem [' + sourceGroupId + '] (libera ' + originTotal.toFixed(2) + ' GB)…');
       const rz = await trySetGroupQuota(sourceGroupId, sourceGroupName, 0);
       if (rz.ok) log('  ✓ cota da origem zerada', 'ok');
-      else       log('  ⚠ RESET falhou · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || '') + ' — cota do destino provavelmente falhará', 'err');
+      else       log('  ⚠ RESET falhou · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || ''), 'err');
       await sleep(600);
     }
 
-    // ── ETAPA 1b: Renomeio ORIGEM (opcional) ──
+    // ── ETAPA 1b/1c: Renomeios ──
     if (isCfg('renomear')) {
       try {
         atualizarStatusUI('Renomeando origem → "GRUPO SEM LINHAS"…');
         log('  · renomeando origem [' + sourceGroupId + '] → "GRUPO SEM LINHAS"');
         await renameGroup(sourceGroupId, CFG.EMPTY_NAME);
         log('  ✓ origem renomeada', 'ok');
-      } catch (err) {
-        log('  ⚠ renomeio origem falhou: ' + err.message, 'err');
-      }
-    } else {
-      log('  ⏭ renomeio DESATIVADO (checkbox)');
-    }
-
-    // ── ETAPA 1c: Renomeio DESTINO (opcional) ──
-    if (isCfg('renomear')) {
+      } catch (err) { log('  ⚠ renomeio origem falhou: ' + err.message, 'err'); }
       try {
         atualizarStatusUI('Renomeando destino → "' + sourceGroupName + '"…');
         log('  · renomeando destino [' + destGroupId + '] → "' + sourceGroupName + '"');
         await renameGroup(destGroupId, sourceGroupName);
         log('  ✓ destino renomeado', 'ok');
-      } catch (err) {
-        log('  ⚠ renomeio destino falhou: ' + err.message, 'err');
-      }
+      } catch (err) { log('  ⚠ renomeio destino falhou: ' + err.message, 'err'); }
     }
 
-    // ── ETAPA 2: Cota no destino (SEMPRE aplica) ──
+    // ── ETAPA 2: Cota no destino ──
     let cotaSuficiente = true;
     if (isCfg('aplicarCota')) {
       atualizarStatusUI('Aplicando cota no destino…');
-
-      // Determina a cota do grupo destino:
-      //   - Grupo NORMAL:    cota TOTAL da origem (transferência 1:1)
-      //   - Grupo ILIMITADO: TODA a cota disponível do GD (unallocatedQuota)
-      let quotaGrupoDest = 0;
-      let origemLabel    = '';
+      let quotaGrupoDest = 0, origemLabel = '';
       if (ilim) {
-        // Refresh do cache pós-RESET pra pegar cota disponível do GD atualizada
-        await fetchDestGroupQuota(destGroupId); // popula cache
+        await fetchDestGroupQuota(destGroupId);
         const gd = findGdGroup([String(sourceGroupId), String(destGroupId)]);
         if (gd) {
-          const gdCache = groupQuotaCache[String(gd.id)] || {};
-          quotaGrupoDest = parseFloat(gdCache.available) || 0;
+          quotaGrupoDest = parseFloat((groupQuotaCache[String(gd.id)] || {}).available) || 0;
           origemLabel = 'GD "' + gd.name + '" [' + gd.id + '] · disponível=' + quotaGrupoDest.toFixed(2) + ' GB';
-          log('  [DBG] cota destino (ilimitado) · ' + origemLabel, 'dbg');
         } else {
-          log('  ⚠ grupo GD não encontrado — usando cota da origem como fallback', 'err');
           quotaGrupoDest = originTotal;
           origemLabel = 'origem (fallback · GD não achado) · ' + originTotal.toFixed(2) + ' GB';
         }
       } else {
         quotaGrupoDest = originTotal;
         origemLabel = 'origem (transferência 1:1) · ' + originTotal.toFixed(2) + ' GB';
-        // Fallback: se cache não tinha, deriva do nome
         if (!quotaGrupoDest) {
-          const perLine = extractQuotaFromGroupName(sourceGroupName);
-          if (perLine && lines.length) {
-            quotaGrupoDest = perLine * lines.length;
-            origemLabel = 'nome (fallback) · ' + perLine + ' × ' + lines.length + ' = ' + quotaGrupoDest.toFixed(2);
-          }
+          const pl = extractQuotaFromGroupName(sourceGroupName);
+          if (pl && lines.length) { quotaGrupoDest = pl * lines.length; origemLabel = 'nome (fallback) · ' + pl + ' × ' + lines.length; }
         }
       }
       log('  [DBG] cota grupo destino = ' + quotaGrupoDest.toFixed(2) + ' GB · origem: ' + origemLabel, 'dbg');
@@ -615,26 +779,14 @@ CHANGELOG v9.0.0
         const r = await trySetGroupQuota(destGroupId, sourceGroupName, quotaGrupoDest);
         if (r.ok) {
           log('  ✓ cota do grupo aplicada · sev=' + (r.json?.severity || 'ok'), 'ok');
-
-          // ── ETAPA 3: cota INDIVIDUAL nas linhas ──
-          //   - Grupo NORMAL: aplica cota específica (quotaPerLine)
-          //   - Grupo ILIMITADO + checkbox ON:  aplica quotaPerLine (extração do nome)
-          //   - Grupo ILIMITADO + checkbox OFF (padrão): aplica SEM cota individual
-          //     (payload sem quota/futureQuota) → linha fica em uso livre da cota do grupo
           if (lines.length > 0) {
             const aplicaCotaIndividual = !ilim || isCfg('ilim');
             let quotaPerLine = null;
             if (aplicaCotaIndividual) {
               const nominal = extractQuotaFromGroupName(sourceGroupName) || (quotaGrupoDest / lines.length);
-              // v9.6.2 — CAP: soma das cotas individuais NÃO pode ultrapassar a cota do grupo
-              // (Vivo rejeita com HTTP 500 · "Erro interno!"). Reduzimos pra caber, arredondando pra baixo (2 casas).
-              const capMax = Math.floor((quotaGrupoDest / lines.length) * 100) / 100;
-              if (nominal > capMax) {
-                log('  ⚠ cota nominal ' + nominal + 'GB/linha × ' + lines.length + ' = ' + (nominal * lines.length).toFixed(2) + 'GB estoura o grupo (' + quotaGrupoDest.toFixed(2) + 'GB) · reduzindo pra ' + capMax + 'GB/linha', 'hl');
-                quotaPerLine = capMax;
-              } else {
-                quotaPerLine = nominal;
-              }
+              const capMax  = Math.floor((quotaGrupoDest / lines.length) * 100) / 100;
+              if (nominal > capMax) { log('  ⚠ nominal ' + nominal + 'GB × ' + lines.length + ' estoura ' + quotaGrupoDest.toFixed(2) + 'GB · CAP ' + capMax + 'GB/linha', 'hl'); quotaPerLine = capMax; }
+              else                  { quotaPerLine = nominal; }
             }
             log('  · applyQuotaToLines · ' + lines.length + ' linha(s) · ' + (aplicaCotaIndividual ? (quotaPerLine + ' GB por linha') : 'SEM cota individual (uso livre)') + '…');
             const rl = await applyQuotaToLines(destGroupId, quotaPerLine, lines);
@@ -653,14 +805,17 @@ CHANGELOG v9.0.0
       log('  ⏭ aplicação de cota DESATIVADA (checkbox)');
     }
 
-    // ── ETAPA 4: Coloração (opcional) + reload (opcional) ──
+    finalizarPostMove(cotaSuficiente);
+  }
+
+  function finalizarPostMove(cotaSuficiente) {
+    const { destGroupId } = pendingMove;
     if (isCfg('colorir')) {
       if (cotaSuficiente) { saveStatus(destGroupId, 'ok'); colorirComRetentativa(destGroupId); }
       else                { saveStatus(destGroupId, 'error'); colorirVermelhoComRetentativa(destGroupId); }
     }
     if (isCfg('reload')) {
-      await sleep(CFG.DELAY_BEFORE_RELOAD);
-      clickConsumoDados();
+      sleep(CFG.DELAY_BEFORE_RELOAD).then(() => clickConsumoDados());
     }
     atualizarStatusUI(cotaSuficiente ? 'Concluído · aguardando próximo movimento…' : 'Concluído com erro · aguardando próximo…');
     resetPendingMove();
@@ -883,12 +1038,16 @@ CHANGELOG v9.0.0
       if (destinoRenomeado && novoVazio.length === 1) {
         const ativas = activeLines(destinoRenomeado);
         const vazio  = activeLines(novoVazio[0]);
+        const historicas = (destinoRenomeado.lines || []).length - ativas.length;
         const have = new Set(ativas.map(msisdnOf).filter(Boolean));
         const faltam = [...expectMsisdns].filter(m => !have.has(m));
         const extras = [...have].filter(m => !expectMsisdns.has(m));
-        resumo = 'destino=' + ativas.length + '/' + expectCount + ' · faltam ' + faltam.length + ' · extras(alheias) ' + extras.length + ' · novoVazio ativas ' + vazio.length;
+        // v9.7.0 — resumo expandido com históricas + msisdns concretos (primeiros 3)
+        const faltamShort = faltam.slice(0, 3).join(',') + (faltam.length > 3 ? '…' : '');
+        const extrasShort = extras.slice(0, 3).join(',') + (extras.length > 3 ? '…' : '');
+        resumo = 'destino=' + ativas.length + '/' + expectCount + ' · faltam ' + faltam.length + (faltam.length ? '[' + faltamShort + ']' : '') + ' · extras ' + extras.length + (extras.length ? '[' + extrasShort + ']' : '') + ' · histórica(s)_destino ' + historicas + ' · novoVazio_ativas ' + vazio.length;
         if (faltam.length === 0 && extras.length === 0 && vazio.length === 0 && ativas.length === expectCount) {
-          return { ok: true };
+          return { ok: true, resumo };
         }
       } else {
         resumo = 'aguardando renomeio · destinoRenomeado=' + !!destinoRenomeado + ' · novoVazio=' + novoVazio.length;
@@ -1077,7 +1236,7 @@ CHANGELOG v9.0.0
           break;
         }
         ok++;
-        log('  ✅ concluído · ' + N + ' linha(s) · GATE 1 ok', 'ok');
+        log('  ✅ concluído · ' + N + ' linha(s) · GATE 1 ok · ' + (g1.resumo || ''), 'ok');
       } catch (e) {
         fail++;
         log('  ⛔ erro inesperado: ' + (e && e.message || e), 'err');
@@ -1740,7 +1899,7 @@ CHANGELOG v9.0.0
     setTimeout(() => { if (isCfg('colorir')) restoreColors(); }, 300);
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
-    log('✅ MoveLines + Cota v9.0.0 carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
+    log('✅ MoveLines + Cota v9.7.0 (herança 3-em-3) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
