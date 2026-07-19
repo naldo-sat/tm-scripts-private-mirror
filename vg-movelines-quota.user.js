@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.7.1
+// @version      9.7.2
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,43 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.7.2 — FIX CRÍTICO ordem RESET-first (GD apertado)
+─────────────────────────────────────────────────────────────
+Bug: em contas com pool GD (unallocatedQuota) apertado, o ciclo 2+
+falhava com HTTP 500 no setGroupQuota(destino, N). Padrão nos logs:
+   • LOG 01 · NALDO SAT · ciclo 2 · 330GB → HTTP 500
+   • LOG 02 · STUDIO ML · ciclo 2 · 600GB → HTTP 500
+
+Causa raiz: a ordem v9.7.0 tentava atribuir cota ao destino ANTES de
+zerar a origem. Como as N GB da origem ainda estavam presas no grupo,
+o pool GD não tinha espaço → Vivo rejeita 500. Matemática de conservação
+da cota — RESET origem primeiro libera o pool.
+
+Ordem nova (v9.7.2):
+   0. Congela originTotalFrozen (const)
+   0b. Log GD_livre pré-RESET (evidência)
+   1. Calcula perLine = min(nominal, floor(origin/N))
+   2. setGroupQuota(source, 0)              ← RESET primeiro
+   3. Micro-gate refetch source.total==0
+   3b. Log GD_livre pós-RESET (delta esperado = +originTotal)
+   4. setGroupQuota(dest, originTotalFrozen)  ← agora GD tem espaço
+   5. Micro-gate refetch dest.total==originTotalFrozen
+   6. applyQuotaToLines(dest, perLine)
+   7. renameGroup(dest, sourceName)          [R1]
+   8. renameGroup(source, EMPTY_NAME)
+
+Blindagem: se RESET origem falhar HTTP 500, ABORTA imediatamente
+(evita cascade — tentar setDest com GD sem espaço só dobra o erro).
+
+Helper novo: getPoolUnallocated() — soma unallocatedQuota dos grupos
+GD conhecidos. Só pra log de evidência, não bloqueia fluxo.
+
+Descartados (viés defensivo do agente adversarial):
+- localStorage persist p/ idempotência: rerun natural já pula grupos
+  com 0 linhas (executarLote L1033).
+- Gate source.linhas.count==0: Vivo aceita zerar grupo com linhas
+  dentro (comprovado v9.6.2 e v9.7.1 em prod).
+
 CHANGELOG v9.7.1 — FIX CRÍTICO nome fabricado
 ─────────────────────────────────────────────────────────────
 Bug: quando a Vivo mandava payload de moveLines SEM
@@ -527,6 +564,20 @@ CHANGELOG v9.0.0
     return { ok: false, total: ultimoTotal, esperado: expectedGB, tentativas: attempts };
   }
 
+  /* v9.7.2 — lê a cota LIVRE do pool GD (unallocatedQuota agregada dos
+     grupos GD conhecidos). Só pra log de evidência — não bloqueia fluxo. */
+  function getPoolUnallocated() {
+    let total = 0;
+    for (const [id, entry] of Object.entries(pageWindow.__moveGroupMap)) {
+      const name = typeof entry === 'object' ? (entry.name || '') : String(entry);
+      if (/^gd\b/i.test(name)) {
+        const c = groupQuotaCache[String(id)] || {};
+        total += parseFloat(c.available) || 0;
+      }
+    }
+    return total;
+  }
+
   function findGdGroup(excludeIds = []) {
     for (const [id, entry] of Object.entries(pageWindow.__moveGroupMap)) {
       if (excludeIds.includes(id)) continue;
@@ -632,18 +683,25 @@ CHANGELOG v9.0.0
     }
   }
 
-  /* v9.7.0 — HERANÇA 3-em-3 (só grupos NORMAIS) */
+  /* v9.7.2 — HERANÇA 3-em-3 (só grupos NORMAIS)
+   * Ordem RESET-FIRST: libera cota da origem pro pool GD ANTES de
+   * atribuir ao destino. Sem isso, contas com GD apertado falham
+   * HTTP 500 no setGroupQuota(dest, X) porque X GB ainda estão
+   * presos na origem — matemática de conservação da cota.
+   */
   async function postMoveFlowHeranca() {
     const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
     let cotaSuficiente = true;
 
-    // ── ETAPA 0: congela originTotalFrozen ANTES de qualquer escrita ──
+    // ── ETAPA 0: captura estado inicial (destino + origem) ──
     await fetchDestGroupQuota(destGroupId); // refresh cache dest
     const destCache = groupQuotaCache[String(destGroupId)] || {};
     const destTotalPre = parseFloat(destCache.total) || 0;
     const cacheOrigem = groupQuotaCache[String(sourceGroupId)] || {};
     const originTotalFrozen = parseFloat(cacheOrigem.total) || getAvailableQuota(sourceGroupId) || 0;
-    log('  [DBG] herança · originTotalFrozen=' + originTotalFrozen.toFixed(2) + ' GB · destTotalPre=' + destTotalPre.toFixed(2) + ' GB · linhas=' + lines.length, 'dbg');
+    // v9.7.2 — captura unallocatedQuota pro log de evidência (pool GD)
+    const gdAvailPre = getPoolUnallocated();
+    log('  [DBG] herança · originTotalFrozen=' + originTotalFrozen.toFixed(2) + ' GB · destTotalPre=' + destTotalPre.toFixed(2) + ' GB · GD_livre=' + gdAvailPre.toFixed(2) + ' GB · linhas=' + lines.length, 'dbg');
 
     if (originTotalFrozen <= 0) {
       log('  ⚠ originTotalFrozen=0 — origem sem cota registrada, herança abortada', 'err');
@@ -665,6 +723,33 @@ CHANGELOG v9.0.0
       }
     }
 
+    // ── ETAPA 1: RESET origem — LIBERA cota pro pool GD ──
+    if (isCfg('aplicarCota')) {
+      atualizarStatusUI('Zerando cota da origem…');
+      log('  · RESET · zerando cota da origem [' + sourceGroupId + '] (libera ' + originTotalFrozen.toFixed(2) + ' GB pro GD)…');
+      const rz = await trySetGroupQuota(sourceGroupId, sourceGroupName, 0);
+      if (!rz.ok) {
+        // Abort early: sem cota livre no GD, o setDest vai falhar também.
+        log('  ⛔ RESET origem FALHOU · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || '') + ' — abortando (evita cascade)', 'err');
+        cotaSuficiente = false;
+        finalizarPostMove(cotaSuficiente);
+        return;
+      }
+      log('  ✓ cota da origem zerada', 'ok');
+
+      // ── ETAPA 2: micro-gate refetch source.total ──
+      const gs = await refetchGroupTotal(sourceGroupId, 0);
+      if (!gs.ok) {
+        log('  ⚠ micro-gate ORIGEM falhou · esperado=0 visto=' + gs.total.toFixed(2) + ' após ' + gs.tentativas + ' tentativas — propagação lenta, seguindo mesmo assim', 'err');
+      } else {
+        log('  ✓ micro-gate ORIGEM ok · total=' + gs.total.toFixed(2) + 'GB · tentativas=' + gs.tentativas, 'ok');
+      }
+      // Log de evidência: pool GD após RESET (deve ter absorvido)
+      await fetchDestGroupQuota(destGroupId); // repopula cache com GD atualizado
+      const gdAvailAposReset = getPoolUnallocated();
+      log('  [DBG] GD_livre pós-RESET=' + gdAvailAposReset.toFixed(2) + ' GB (delta=+' + (gdAvailAposReset - gdAvailPre).toFixed(2) + ')', 'dbg');
+    }
+
     // ── ETAPA 3: setGroupQuota(dest, originTotalFrozen) [R2] ──
     if (isCfg('aplicarCota')) {
       atualizarStatusUI('Aplicando cota herdada no destino…');
@@ -679,13 +764,12 @@ CHANGELOG v9.0.0
       log('  ✓ cota do grupo aplicada · sev=' + (r.json?.severity || 'ok'), 'ok');
 
       // ── ETAPA 4: micro-gate refetch dest.total ──
-      const g = await refetchGroupTotal(destGroupId, originTotalFrozen);
-      if (!g.ok) {
-        log('  ⚠ micro-gate DEST falhou · esperado=' + originTotalFrozen.toFixed(2) + ' visto=' + g.total.toFixed(2) + ' após ' + g.tentativas + ' tentativas — propagação async não confirmada', 'err');
+      const gd = await refetchGroupTotal(destGroupId, originTotalFrozen);
+      if (!gd.ok) {
+        log('  ⚠ micro-gate DEST falhou · esperado=' + originTotalFrozen.toFixed(2) + ' visto=' + gd.total.toFixed(2) + ' após ' + gd.tentativas + ' tentativas — propagação async não confirmada', 'err');
         cotaSuficiente = false;
-        // Segue mesmo assim pra tentar aplicar cotas nas linhas (Vivo às vezes propaga tardio)
       } else {
-        log('  ✓ micro-gate DEST ok · total=' + g.total.toFixed(2) + 'GB · tentativas=' + g.tentativas, 'ok');
+        log('  ✓ micro-gate DEST ok · total=' + gd.total.toFixed(2) + 'GB · tentativas=' + gd.tentativas, 'ok');
       }
     }
 
@@ -707,23 +791,7 @@ CHANGELOG v9.0.0
       } catch (err) { log('  ⚠ renomeio destino falhou: ' + err.message, 'err'); }
     }
 
-    // ── ETAPA 7: setGroupQuota(source, 0) — RESET agora ──
-    if (isCfg('aplicarCota')) {
-      atualizarStatusUI('Zerando cota da origem…');
-      log('  · RESET · zerando cota da origem [' + sourceGroupId + '] (libera ' + originTotalFrozen.toFixed(2) + ' GB)…');
-      const rz = await trySetGroupQuota(sourceGroupId, sourceGroupName, 0);
-      if (rz.ok) {
-        log('  ✓ cota da origem zerada', 'ok');
-        // ── ETAPA 8: micro-gate refetch source.total ──
-        const g = await refetchGroupTotal(sourceGroupId, 0);
-        if (!g.ok) log('  ⚠ micro-gate ORIGEM falhou · esperado=0 visto=' + g.total.toFixed(2) + ' após ' + g.tentativas + ' tentativas — pool GD pode estar inflado', 'err');
-        else       log('  ✓ micro-gate ORIGEM ok · total=' + g.total.toFixed(2) + 'GB · tentativas=' + g.tentativas, 'ok');
-      } else {
-        log('  ⚠ RESET falhou · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || ''), 'err');
-      }
-    }
-
-    // ── ETAPA 9: renameGroup(source, EMPTY_NAME) ──
+    // ── ETAPA 7: renameGroup(source, EMPTY_NAME) ──
     if (isCfg('renomear')) {
       try {
         atualizarStatusUI('Renomeando origem → "GRUPO SEM LINHAS"…');
@@ -1930,7 +1998,7 @@ CHANGELOG v9.0.0
     setTimeout(() => { if (isCfg('colorir')) restoreColors(); }, 300);
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
-    log('✅ MoveLines + Cota v9.7.1 (herança 3-em-3) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
+    log('✅ MoveLines + Cota v9.7.2 (herança 3-em-3 · RESET-first) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
