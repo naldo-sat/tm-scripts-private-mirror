@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.11.0
+// @version      10.0.0
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,45 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v10.0.0 — Delays reduzidos + timer/counters/highlight + retry F1
+─────────────────────────────────────────────────────────────
+Naldo (19/07/26 13:59): "quick wins delays + layout painel + F1 retry".
+
+1. DELAYS REDUZIDOS (quick wins A-E)
+   • Polling gatePosMove: 2500 → 1500 ms  (herança)
+   • Polling validarRoundtrip: 2500 → 1500 ms  (ilimitado)
+   • Sleep entre grupos no executarLote: 1200 → 600 ms
+   • Sleep pré-move no roundtripIlimitado: 600 → 300 ms
+   Estimado ~3-5s a menos por grupo. Micro-gates cobrem propagação.
+
+2. TIMER + ESTIMATIVA no painel
+   • Nova linha: "⏱ 12s · 4m 30s rest"
+   • Timer decorrido (setInterval 1s)
+   • ETA = restam × (dec/feitos) — vai calibrando conforme processa
+
+3. CONTADORES AO VIVO
+   • Nova linha: "✅ 4  ⛔ 1  ↷ 0  restam 3"
+   • Atualiza a cada grupo concluído
+   • ok verde, fail vermelho, skip cinza, rest azul
+
+4. HIGHLIGHT VISUAL na lista de grupos
+   • Item processando: fundo laranja + borda esquerda amarela + texto bold
+   • Concluído OK: fundo verde claro + borda verde
+   • Falhou: fundo vermelho claro + borda vermelha
+   • Pulado (sem linhas): fundo cinza + opacidade reduzida
+   • Limpa ao iniciar novo batch
+
+5. F1 · RETRY AUTOMÁTICO DE FALHAS TRANSIENTES
+   • Refatorei o loop pra usar função processarGrupo() com result:
+     'ok' | 'skip' | 'fail-retry' | 'fail-halt'
+   • fail-retry: timeout postMoveFlow (90s) OU GATE 1 falha
+     → não interrompe batch, coleta em `falhasTentaveis`, marca fail
+   • fail-halt: GATE 0 falha / move falha / MSISDN duplicado / exceção
+     → interrompe batch imediatamente
+   • Ao fim do batch (se não interrompido), roda RETRY sobre `falhasTentaveis`
+     Se OK no retry, decrementa fail, incrementa ok, log "recuperada"
+   • Botão "copiar log" (📋) já existia — mantido
+
 CHANGELOG v9.11.0 — ILIMITADO: só roundtrip pelo GD (ui2ui default)
 ─────────────────────────────────────────────────────────────
 Naldo (19/07/26 13:26): pra ilimitado, só movimentação. Sem tocar em
@@ -1340,7 +1379,7 @@ CHANGELOG v9.0.0
       } else {
         resumo = 'aguardando renomeio · destinoRenomeado=' + !!destinoRenomeado + ' · novoVazio=' + novoVazio.length;
       }
-      await sleep(2500);
+      await sleep(1500); // v10.0.0: era 2500
     }
     return { ok: false, motivo: 'não confluiu em ' + Math.round(timeout / 1000) + 's (' + resumo + ')' };
   }
@@ -1351,7 +1390,7 @@ CHANGELOG v9.0.0
   async function validarRoundtrip(sess, expectGroupId, expectMsisdns, expectCount, emptyGroupId, opt) {
     opt = opt || {};
     const timeout  = opt.timeout  || 45000;
-    const interval = opt.interval || 2500;
+    const interval = opt.interval || 1500; // v10.0.0: era 2500
     const t0 = Date.now();
     let resumo = '';
     while (Date.now() - t0 <= timeout) {
@@ -1389,7 +1428,7 @@ CHANGELOG v9.0.0
      Sem RESET, sem REAPPLY, sem herança de nome/cota. Renova a franquia
      Vivo pelo próprio round-trip. */
   async function roundtripIlimitado(sess, gid, nome) {
-    fecharModais(); colapsarGrupos(); await sleep(600);
+    fecharModais(); colapsarGrupos(); await sleep(300);
 
     log('  · lendo grupos (loadView)…');
     const all = await loadViewUI(sess);
@@ -1433,7 +1472,7 @@ CHANGELOG v9.0.0
     log('  ✓ IDA validada: ' + N + ' no GD, origem vazia', 'ok');
 
     // ② VOLTA: GD → origem (100% cliques UI)
-    fecharModais(); colapsarGrupos(); await sleep(600);
+    fecharModais(); colapsarGrupos(); await sleep(300);
     log('  ═══ ② VOLTA: GD → "' + nome + '" ═══', 'hl');
     const volta = await moverPorCliques(gdid, gd.name, gid, nome);
     if (!volta.ok) return { halt: true, motivo: 'VOLTA falhou — ' + volta.motivo + ' (linhas ficaram no GD!)' };
@@ -1534,7 +1573,7 @@ CHANGELOG v9.0.0
     }, 3000);
   }
 
-  function setProgresso(feitos, total, nomeAtual) {
+  function setProgresso(feitos, total, nomeAtual, counters) {
     const p = document.getElementById('mlq-progress');
     if (!p) return;
     const pct = total > 0 ? Math.round(feitos / total * 100) : 0;
@@ -1544,6 +1583,47 @@ CHANGELOG v9.0.0
     p.querySelector('.mlq-pg-pct').textContent = pct + '%';
     p.querySelector('.mlq-pg-fill').style.width = pct + '%';
     p.querySelector('.mlq-pg-atual').textContent = nomeAtual || (feitos === total ? 'Concluído.' : 'Aguardando…');
+    // v10.0.0 — contadores ao vivo
+    if (counters) {
+      p.querySelector('.mlq-pg-counters .ok').textContent   = '✅ ' + counters.ok;
+      p.querySelector('.mlq-pg-counters .fail').textContent = '⛔ ' + counters.fail;
+      p.querySelector('.mlq-pg-counters .skip').textContent = '↷ ' + counters.skip;
+      p.querySelector('.mlq-pg-counters .rest').textContent = 'restam ' + Math.max(0, total - feitos);
+    }
+  }
+
+  // v10.0.0 — timer + estimativa restante (chamado por setInterval)
+  let progressTimer = null;
+  function iniciarProgressoTimer(tsStart, getFeitos, total) {
+    pararProgressoTimer();
+    progressTimer = setInterval(() => {
+      const p = document.getElementById('mlq-progress');
+      if (!p) return;
+      const dec = Math.round((Date.now() - tsStart) / 1000);
+      const feitos = getFeitos();
+      const avg = feitos > 0 ? dec / feitos : 0;
+      const restam = Math.max(0, total - feitos);
+      const eta = restam > 0 && avg > 0 ? Math.round(restam * avg) : null;
+      const decStr = dec < 60 ? dec + 's' : Math.floor(dec / 60) + 'm ' + (dec % 60) + 's';
+      const etaStr = eta === null ? 'estimando…' : (eta < 60 ? eta + 's rest' : Math.floor(eta / 60) + 'm ' + (eta % 60) + 's rest');
+      const decEl = p.querySelector('.mlq-pg-timer .dec');
+      const etaEl = p.querySelector('.mlq-pg-timer .eta');
+      if (decEl) decEl.textContent = decStr;
+      if (etaEl) etaEl.textContent = etaStr;
+    }, 1000);
+  }
+  function pararProgressoTimer() {
+    if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+  }
+
+  // v10.0.0 — highlight visual do grupo na lista
+  function marcarGrupoLista(gid, estado) {
+    const row = document.querySelector('#mlq-list .mlq-cb[value="' + gid + '"]');
+    if (!row) return;
+    const label = row.closest('label.mlq-g');
+    if (!label) return;
+    label.classList.remove('processing', 'done-ok', 'done-fail', 'done-skip');
+    if (estado) label.classList.add(estado);
   }
 
   async function executarLote() {
@@ -1569,6 +1649,9 @@ CHANGELOG v9.0.0
     // grupos numerados (evita fallback "GRUPO <id>" no handleMoveLines).
     for (const g of gruposCache) pageWindow.__moveGroupMap[String(g.id)] = { name: g.name };
 
+    // v10.0.0 — limpa highlights de batch anterior
+    qsa('#mlq-list label.mlq-g').forEach(el => el.classList.remove('processing', 'done-ok', 'done-fail', 'done-skip'));
+
     // v9.6.0 — gravação na planilha (início + fim), padrão ui2ui
     const gravarLog = isCfg('gravarPlanilha');
     const logConta  = gravarLog ? obterContaAtiva() : null;
@@ -1584,122 +1667,135 @@ CHANGELOG v9.0.0
     }
 
     log('═══════ INICIANDO · ' + total + ' grupo(s) → "GRUPO SEM LINHAS" (isolamento anti-mistura) ═══════', 'hl');
-    setProgresso(0, total, 'Iniciando…');
+    setProgresso(0, total, 'Iniciando…', { ok: 0, fail: 0, skip: 0 });
+
+    // v10.0.0 — timer + retry
+    let skip = 0;
+    const falhasTentaveis = []; // { gid, nome, motivo } · pra retry F1 no fim
+    iniciarProgressoTimer(tsInicio, () => ok + fail + skip, total);
+
+    // v10.0.0 — extrai o processamento de 1 grupo pra função pura (facilita retry)
+    // result: 'ok' | 'skip' | 'fail-retry' | 'fail-halt'
+    async function processarGrupo(gid, nome) {
+      if (isIlimitado(nome)) {
+        log('  · rota ILIMITADO → roundtrip GD (fluxo ui2ui, 100% UI)');
+        const rt = await roundtripIlimitado(sess, gid, nome);
+        if (rt.skip) return { result: 'skip', motivo: rt.motivo };
+        if (rt.halt) return { result: 'fail-halt', motivo: rt.motivo };
+        log('  ✅ ilimitado concluído · ' + rt.N + ' linha(s) · round-trip validado (sem tocar em cota)', 'ok');
+        return { result: 'ok' };
+      }
+      // NORMAL: herança 3-em-3 via "GRUPO SEM LINHAS"
+      log('  · GATE 0: validando "GRUPO SEM LINHAS" vazio…');
+      const g0 = await gateDestinoVazio(sess);
+      if (!g0.ok) return { result: 'fail-halt', motivo: 'GATE 0 — ' + g0.motivo };
+      if (g0.historicas > 0) log('    (' + g0.historicas + ' histórica[s] no destino — ignoradas)');
+      const destId = g0.destId, destName = g0.destName;
+
+      const allPre = await loadViewUI(sess);
+      const origemPre = allPre.find(x => String(x.id) === String(gid));
+      if (!origemPre) return { result: 'fail-halt', motivo: 'origem [' + gid + '] não encontrada no loadView' };
+      const ativasPre = activeLines(origemPre);
+      const N = ativasPre.length;
+      if (N === 0) return { result: 'skip', motivo: 'origem sem linhas ativas' };
+      const msisdnsEsperados = new Set(ativasPre.map(msisdnOf).filter(Boolean));
+      if (msisdnsEsperados.size !== N) {
+        return { result: 'fail-halt', motivo: 'origem tem ' + N + ' ativas mas só ' + msisdnsEsperados.size + ' MSISDNs únicos' };
+      }
+      log('  · ' + N + ' linha(s) esperada(s) · destino "' + destName + '" [' + destId + ']');
+
+      const r = await moverPorCliques(gid, nome, destId, destName);
+      if (!r.ok) return { result: 'fail-halt', motivo: 'move falhou — ' + r.motivo };
+      log('  ✓ move disparado — aguardando renomeio+cota…');
+
+      const finalizou = await aguardarPostMove(90000);
+      if (!finalizou) return { result: 'fail-retry', motivo: 'timeout no postMoveFlow (90s) · transiente' };
+
+      log('  · GATE 1: validando linhas no destino + novo vazio…');
+      const g1 = await gatePosMove(sess, msisdnsEsperados, N, nome);
+      if (!g1.ok) return { result: 'fail-retry', motivo: 'GATE 1 — ' + g1.motivo + ' · transiente' };
+      log('  ✅ concluído · ' + N + ' linha(s) · GATE 1 ok · ' + (g1.resumo || ''), 'ok');
+      return { result: 'ok' };
+    }
 
     for (let i = 0; i < marcados.length; i++) {
       if (parou) break;
       const gid = marcados[i];
       const g   = gruposCache.find(x => x.id === gid);
       const nome = g ? g.name : gid;
-      setProgresso(i, total, 'Processando: ' + nome);
+      setProgresso(i, total, 'Processando: ' + nome, { ok, fail, skip });
+      marcarGrupoLista(gid, 'processing');
       log('▶ ' + nome + ' [' + gid + ']', 'hl');
 
+      let r;
       try {
-        // v9.9.0 — ILIMITADO: usa roundtrip GD (fluxo ui2ui), NÃO passa pelo "GRUPO SEM LINHAS"
-        if (isIlimitado(nome)) {
-          log('  · rota ILIMITADO → roundtrip GD (fluxo ui2ui, 100% UI)');
-          const rt = await roundtripIlimitado(sess, gid, nome);
-          if (rt.skip) {
-            log('  ↷ ' + rt.motivo + ' — pulando');
-            setProgresso(i + 1, total, 'Próximo…');
-            fecharModais(); colapsarGrupos(); await sleep(1200);
-            continue;
-          }
-          if (rt.halt) {
-            fail++;
-            log('  ⛔ roundtrip ilimitado falhou — ' + rt.motivo, 'err');
-            log('═══════ ⛔ INTERROMPIDO em "' + nome + '" — ' + ok + ' ok antes. Verifique manualmente antes de rodar de novo. ═══════', 'err');
-            parou = true;
-            break;
-          }
-          ok++;
-          log('  ✅ ilimitado concluído · ' + rt.N + ' linha(s) · round-trip validado (sem tocar em cota)', 'ok');
-          setProgresso(i + 1, total, i + 1 === total ? 'Concluído.' : 'Próximo…');
-          fecharModais(); colapsarGrupos(); await sleep(1200);
-          continue;
-        }
-
-        // ── NORMAL: fluxo herança 3-em-3 via "GRUPO SEM LINHAS" ──
-        // ── GATE 0 (pré-move): destino "GRUPO SEM LINHAS" está vazio? ──
-        log('  · GATE 0: validando "GRUPO SEM LINHAS" vazio…');
-        const g0 = await gateDestinoVazio(sess);
-        if (!g0.ok) {
-          fail++;
-          log('  ⛔ GATE 0 falhou — ' + g0.motivo, 'err');
-          log('═══════ ⛔ INTERROMPIDO em "' + nome + '" — ' + ok + ' ok antes. Corrija e rode de novo. ═══════', 'err');
-          parou = true;
-          break;
-        }
-        if (g0.historicas > 0) log('    (' + g0.historicas + ' histórica[s] no destino — ignoradas)');
-        const destId = g0.destId, destName = g0.destName;
-
-        // ── Captura o conjunto esperado de MSISDNs da origem (pré-move) ──
-        const allPre = await loadViewUI(sess);
-        const origemPre = allPre.find(x => String(x.id) === String(gid));
-        if (!origemPre) { fail++; log('  ⛔ origem [' + gid + '] não encontrada no loadView', 'err'); parou = true; break; }
-        const ativasPre = activeLines(origemPre);
-        const N = ativasPre.length;
-        if (N === 0) {
-          log('  ↷ origem sem linhas ativas — pulando');
-          setProgresso(i + 1, total, 'Próximo…');
-          continue;
-        }
-        const msisdnsEsperados = new Set(ativasPre.map(msisdnOf).filter(Boolean));
-        if (msisdnsEsperados.size !== N) {
-          fail++;
-          log('  ⛔ origem tem ' + N + ' ativas mas só ' + msisdnsEsperados.size + ' MSISDNs únicos — não dá pra validar por identidade', 'err');
-          parou = true;
-          break;
-        }
-        log('  · ' + N + ' linha(s) esperada(s) · destino "' + destName + '" [' + destId + ']');
-
-        // ── MOVE via cliques ──
-        const r = await moverPorCliques(gid, nome, destId, destName);
-        if (!r.ok) {
-          fail++;
-          log('  ⛔ move falhou — ' + r.motivo, 'err');
-          log('═══════ ⛔ INTERROMPIDO — ' + ok + ' ok antes. ═══════', 'err');
-          parou = true;
-          break;
-        }
-        log('  ✓ move disparado — aguardando renomeio+cota…');
-
-        // ── Aguarda postMoveFlow (renomeio + cota) ──
-        const finalizou = await aguardarPostMove(90000);
-        if (!finalizou) {
-          fail++;
-          log('  ⛔ timeout no postMoveFlow (90s)', 'err');
-          log('═══════ ⛔ INTERROMPIDO — ' + ok + ' ok antes. ═══════', 'err');
-          parou = true;
-          break;
-        }
-
-        // ── GATE 1 (pós): valida que os N MSISDNs foram parar no destino
-        //    renomeado, e que o novo "GRUPO SEM LINHAS" está vazio ──
-        log('  · GATE 1: validando linhas no destino + novo vazio…');
-        const g1 = await gatePosMove(sess, msisdnsEsperados, N, nome);
-        if (!g1.ok) {
-          fail++;
-          log('  ⛔ GATE 1 falhou — ' + g1.motivo, 'err');
-          log('═══════ ⛔ INTERROMPIDO em "' + nome + '" — ' + ok + ' ok antes. Verifique manualmente antes de rodar de novo. ═══════', 'err');
-          parou = true;
-          break;
-        }
-        ok++;
-        log('  ✅ concluído · ' + N + ' linha(s) · GATE 1 ok · ' + (g1.resumo || ''), 'ok');
+        r = await processarGrupo(gid, nome);
       } catch (e) {
+        r = { result: 'fail-halt', motivo: 'erro inesperado: ' + (e && e.message || e) };
+      }
+
+      if (r.result === 'ok') {
+        ok++;
+        marcarGrupoLista(gid, 'done-ok');
+      } else if (r.result === 'skip') {
+        skip++;
+        log('  ↷ ' + r.motivo + ' — pulando', 'hl');
+        marcarGrupoLista(gid, 'done-skip');
+      } else if (r.result === 'fail-retry') {
         fail++;
-        log('  ⛔ erro inesperado: ' + (e && e.message || e), 'err');
+        log('  ⚠ falha transiente — ' + r.motivo + ' · marcado pra RETRY no fim', 'err');
+        falhasTentaveis.push({ gid, nome, motivo: r.motivo });
+        marcarGrupoLista(gid, 'done-fail');
+      } else { // fail-halt
+        fail++;
+        log('  ⛔ ' + r.motivo, 'err');
+        log('═══════ ⛔ INTERROMPIDO em "' + nome + '" — ' + ok + ' ok antes. Corrija e rode de novo. ═══════', 'err');
+        marcarGrupoLista(gid, 'done-fail');
         parou = true;
       }
-      setProgresso(i + 1, total, i + 1 === total ? 'Concluído.' : 'Próximo…');
+
+      setProgresso(i + 1, total, i + 1 === total ? 'Concluído.' : 'Próximo…', { ok, fail, skip });
       fecharModais();
       colapsarGrupos();
-      await sleep(1200);
+      await sleep(600); // v10.0.0: era 1200
     }
 
-    log('═══════ fim · ' + ok + ' ok · ' + fail + ' falha' + (parou ? ' · INTERROMPIDO' : '') + ' ═══════', parou ? 'err' : 'hl');
-    setProgresso(total, total, parou ? 'Interrompido' : 'Concluído.');
+    // v10.0.0 — F1: RETRY automático das falhas transientes (só se batch não foi interrompido)
+    if (!parou && falhasTentaveis.length > 0) {
+      const failAntesRetry = fail;
+      log('', 'hl');
+      log('═══════ RETRY · ' + falhasTentaveis.length + ' falha(s) transiente(s) ═══════', 'hl');
+      for (let k = 0; k < falhasTentaveis.length; k++) {
+        const { gid, nome, motivo: motivoOriginal } = falhasTentaveis[k];
+        setProgresso(total, total, 'RETRY ' + (k + 1) + '/' + falhasTentaveis.length + ': ' + nome, { ok, fail, skip });
+        marcarGrupoLista(gid, 'processing');
+        log('↻ RETRY · ' + nome + ' [' + gid + '] · motivo original: ' + motivoOriginal, 'hl');
+        let r;
+        try {
+          r = await processarGrupo(gid, nome);
+        } catch (e) {
+          r = { result: 'fail-halt', motivo: 'erro inesperado no retry: ' + (e && e.message || e) };
+        }
+        if (r.result === 'ok') {
+          ok++; fail--; // recupera contadores
+          log('  ✓ RETRY OK · falha recuperada', 'ok');
+          marcarGrupoLista(gid, 'done-ok');
+        } else if (r.result === 'skip') {
+          log('  ↷ RETRY SKIP · ' + r.motivo, 'hl');
+          marcarGrupoLista(gid, 'done-skip');
+        } else {
+          log('  ⛔ RETRY FALHOU · ' + r.motivo + ' — falha permanece', 'err');
+          marcarGrupoLista(gid, 'done-fail');
+        }
+        fecharModais(); colapsarGrupos(); await sleep(600);
+      }
+      log('═══════ fim RETRY · recuperadas: ' + (failAntesRetry - fail) + '/' + falhasTentaveis.length + ' ═══════', 'hl');
+    }
+
+    pararProgressoTimer();
+
+    log('═══════ fim · ' + ok + ' ok · ' + fail + ' falha · ' + skip + ' skip' + (parou ? ' · INTERROMPIDO' : '') + ' ═══════', parou ? 'err' : 'hl');
+    setProgresso(total, total, parou ? 'Interrompido' : 'Concluído.', { ok, fail, skip });
 
     // v9.6.0 — gravação final na planilha (sobrescreve o "Renovando...")
     if (gravarLog && logConta && logAba) {
@@ -2186,11 +2282,25 @@ CHANGELOG v9.0.0
     #mlq-progress.hidden { display: none; }
     .mlq-pg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11.5px; color: #6B7280; }
     .mlq-pg-head b { color: #111827; font-weight: 700; }
+    .mlq-pg-timer { font-size: 11px; color: #6B7280; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+    .mlq-pg-timer .eta { color: #2157d9; font-weight: 600; }
+    .mlq-pg-counters { font-size: 11.5px; color: #374151; margin-bottom: 6px; display: flex; gap: 10px; font-variant-numeric: tabular-nums; }
+    .mlq-pg-counters .ok { color: #16a34a; font-weight: 700; }
+    .mlq-pg-counters .fail { color: #dc2626; font-weight: 700; }
+    .mlq-pg-counters .skip { color: #6B7280; font-weight: 600; }
+    .mlq-pg-counters .rest { color: #2157d9; font-weight: 700; }
     .mlq-pg-atual { font-size: 12px; color: #111827; font-weight: 600; margin-bottom: 6px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .mlq-pg-bar { height: 8px; background: #DBE7FB; border-radius: 999px; overflow: hidden; }
     .mlq-pg-fill { height: 100%; background: #2157d9; transition: width .4s ease; border-radius: 999px; width: 0%; }
+
+    /* v10.0.0 — highlight visual do grupo processando na lista */
+    .mlq-g.processing { background: #FFF7ED; border-left: 3px solid #F59E0B; }
+    .mlq-g.processing .nm { color: #92400E; font-weight: 700; }
+    .mlq-g.done-ok { background: #F0FDF4; border-left: 3px solid #22c55e; }
+    .mlq-g.done-fail { background: #FEF2F2; border-left: 3px solid #ef4444; }
+    .mlq-g.done-skip { background: #F9FAFB; border-left: 3px solid #9CA3AF; opacity: .7; }
 
     #mlq-actions { padding: 8px 12px; display: flex; gap: 6px; flex-shrink: 0; background: #fff; border-top: 1px solid #F3F4F6; border-bottom: 1px solid #F3F4F6; }
     #mlq-go { flex: 1; background: #2157d9; color: #fff; border: none; border-radius: 8px; padding: 10px;
@@ -2262,6 +2372,8 @@ CHANGELOG v9.0.0
       </div>
       <div id="mlq-progress" class="hidden">
         <div class="mlq-pg-head"><span>Progresso</span><span class="mlq-pg-count"><b>0</b>/<span class="mlq-pg-total">0</span> · <span class="mlq-pg-pct">0%</span></span></div>
+        <div class="mlq-pg-timer">⏱ <span class="dec">0s</span> · <span class="eta">estimando…</span></div>
+        <div class="mlq-pg-counters"><span class="ok">✅ 0</span><span class="fail">⛔ 0</span><span class="skip">↷ 0</span><span class="rest">restam N</span></div>
         <div class="mlq-pg-atual">Aguardando…</div>
         <div class="mlq-pg-bar"><div class="mlq-pg-fill"></div></div>
       </div>
@@ -2361,7 +2473,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v9.11.0 (ilimitado: só roundtrip pelo GD · sem tocar em cota) carregado', 'ok');
+    log('✅ MoveLines + Cota v10.0.0 (delays reduzidos + timer/counters/highlight + retry F1) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
