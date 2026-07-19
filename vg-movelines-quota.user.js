@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.10.0
+// @version      9.11.0
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,62 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.11.0 — ILIMITADO: só roundtrip pelo GD (ui2ui default)
+─────────────────────────────────────────────────────────────
+Naldo (19/07/26 13:26): pra ilimitado, só movimentação. Sem tocar em
+cota. Move pro GD (como o fluxo ui2ui), valida, devolve.
+
+Motivo: as tentativas de RESET+REAPPLY em grupo vazio esbarraram em
+limite estrutural da Vivo (HTTP 500 confirmado 3 vezes v9.9.2, v9.9.3
+com fluxo pós-VOLTA, v9.10.0 com GRUPO SEM LINHAS). Naldo rejeita o
+fallback "VOLTA+REAPPLY" e opta pela solução simples do ui2ui.
+
+Fluxo final v9.11.0:
+   1. Encontra GD único
+   2. GATE 0: GD funcionalmente vazio (só ativas travam)
+   3. IDA origem → GD (100% cliques UI)
+   4. Valida IDA
+   5. VOLTA GD → origem (100% cliques UI)
+   6. Valida VOLTA
+
+Sem RESET, sem REAPPLY, sem herança, sem escudo do interceptor.
+Round-trip pelo GD renova a franquia Vivo naturalmente.
+
+Removido:
+- Congela cotaGrupoFrozen · não precisa mais
+- setGroupQuota calls · não precisa mais
+- Fallback lógico · não precisa mais
+- Branch de "PARCIAL" no executarLote · não precisa mais
+
+CHANGELOG v9.10.1 — Fallback pra REAPPLY quando grupo vazio rejeita 500
+─────────────────────────────────────────────────────────────
+Naldo (19/07/26 13:21): "elas só devem voltar quando a cota tiver sido
+restaurada" + pediu fallback.
+
+Diagnóstico definitivo (log 13:19:19): Vivo rejeita setGroupQuota(gid,>0)
+em grupo com 0 linhas ativas com HTTP 500 (sem result). Limite estrutural,
+independente do pool GD (log mostrou pool=1000GB livres). NÃO é lag.
+
+Fluxo v9.10.1 = intenção do Naldo + fallback automático:
+   1. IDA origem → GSL
+   2. Valida IDA
+   3. RESET grupo origem → 0
+   4. REAPPLY grupo origem → cotaGrupoFrozen (com origem vazia)
+      Se OK  → passo 5 (caminho feliz que o Naldo pediu)
+      Se 500 → FALLBACK:
+        a. VOLTA GSL → origem (agora)
+        b. Valida VOLTA
+        c. REAPPLY grupo origem → cotaGrupoFrozen (agora com linhas → aceita)
+        d. Se OK → fim OK · Se falha → reporta manual
+   5. VOLTA GSL → origem (só se fallback não já fez)
+   6. Valida VOLTA
+
+Trade-off aceito: se o REAPPLY em grupo vazio nunca funcionar (como parece
+ser o caso pelo log), o fallback SEMPRE roda — vira efetivamente
+IDA → RESET → tenta REAPPLY (falha) → VOLTA → REAPPLY. Um passo extra
+inútil, mas garante correção. Se algum dia a Vivo mudar comportamento,
+o caminho feliz volta a funcionar.
+
 CHANGELOG v9.10.0 — Ilimitado usa GRUPO SEM LINHAS (não mais GD)
 ─────────────────────────────────────────────────────────────
 Naldo (19/07/26 13:09): simplificar — em vez do GD, usar o próprio
@@ -1317,38 +1373,38 @@ CHANGELOG v9.0.0
     return { ok: false, motivo: 'não confluiu em ' + Math.round(timeout / 1000) + 's (' + resumo + ')' };
   }
 
-  /* v9.10.0 — ROUNDTRIP ILIMITADO via "GRUPO SEM LINHAS" (não usa mais o GD)
-     Naldo (19/07/26 13:09): simplificar — usar o GRUPO SEM LINHAS como
-     área temporária, RESET+REAPPLY com origem vazia, depois devolver.
-     Sem herança de nome/cota; o grupo original mantém identidade.
+  /* v9.11.0 — ROUNDTRIP ILIMITADO puro (ui2ui default)
+     Naldo (19/07/26 13:26): pra ilimitado, só movimentação. Sem tocar
+     em cota. Move pro GD, valida, devolve. Idêntico ao roundtripManual
+     do ui2ui rodando com defaults (ignoraReset=true, ignoraCotaIlim=true).
 
      Fluxo:
-       0. GATE 0: GRUPO SEM LINHAS vazio? (reusa gateDestinoVazio)
-       1. Congela cotaGrupoFrozen
-       2. IDA origem → GRUPO SEM LINHAS (100% cliques UI, interceptor SKIP)
-       3. Valida IDA
-       4. RESET cota grupo origem → 0
-       5. REAPPLY cota grupo origem → cotaGrupoFrozen
-       6. VOLTA GRUPO SEM LINHAS → origem (100% cliques UI, interceptor SKIP)
-       7. Valida VOLTA
+       1. Encontra GD único
+       2. GATE 0: GD funcionalmente vazio (só ativas travam)
+       3. IDA origem → GD (100% cliques UI)
+       4. Valida IDA (todas no GD, origem vazia)
+       5. VOLTA GD → origem (100% cliques UI)
+       6. Valida VOLTA (todas na origem, GD vazio)
 
-     ATENÇÃO: interceptor pega move pra "GRUPO SEM LINHAS" e dispara
-     postMoveFlow (herança 3-em-3). Setamos pendingMove.active=true como
-     escudo pra bypass — o interceptor pula. Reset ao final. */
+     Sem RESET, sem REAPPLY, sem herança de nome/cota. Renova a franquia
+     Vivo pelo próprio round-trip. */
   async function roundtripIlimitado(sess, gid, nome) {
     fecharModais(); colapsarGrupos(); await sleep(600);
 
-    // ── GATE 0: GRUPO SEM LINHAS existe e está vazio? ──
-    const g0 = await gateDestinoVazio(sess);
-    if (!g0.ok) return { halt: true, motivo: 'GATE 0 falhou — ' + g0.motivo };
-    if (g0.historicas > 0) log('  · GRUPO SEM LINHAS tem ' + g0.historicas + ' histórica[s] (bcs=1) — ignoradas');
-    const gslId = g0.destId, gslNome = g0.destName;
-
-    // ── Origem: valida linhas ativas + congela cota ──
     log('  · lendo grupos (loadView)…');
     const all = await loadViewUI(sess);
     const g = all.find(x => String(x.id) === String(gid));
     if (!g) return { halt: true, motivo: 'grupo [' + gid + '] não encontrado no loadView' };
+
+    // GD único
+    const gds = all.filter(ehGD_ui);
+    if (gds.length !== 1) {
+      return { halt: true, motivo: gds.length === 0 ? 'GD não encontrado' : 'achei ' + gds.length + ' grupos GD (' + gds.map(x => x.name).join(', ') + ') — esperado exatamente 1' };
+    }
+    const gd = gds[0];
+    const gdid = String(gd.id);
+
+    // Origem: valida linhas ativas + identidade
     const ativas = activeLines(g);
     const N = ativas.length;
     if (N === 0) return { skip: true, motivo: 'origem sem ativas' };
@@ -1357,70 +1413,37 @@ CHANGELOG v9.0.0
       return { halt: true, motivo: 'origem tem ' + N + ' ativas mas só ' + msisdnsOrigem.size + ' MSISDNs únicos — não dá pra validar por identidade' };
     }
 
-    await fetchDestGroupQuota(gid);
-    const cacheOrigem = groupQuotaCache[String(gid)] || {};
-    const cotaGrupoFrozen = parseFloat(cacheOrigem.total) || 0;
-    log('  · cotaGrupoFrozen=' + cotaGrupoFrozen.toFixed(2) + ' GB · GRUPO SEM LINHAS=' + gslNome + ' [' + gslId + ']');
-
-    // ── ① IDA: origem → GRUPO SEM LINHAS (escudo: pendingMove.active=true) ──
-    log('  ═══ ① IDA: "' + nome + '" → "' + gslNome + '" (' + N + ' linha[s]) ═══', 'hl');
-    pendingMove.active = true; // bypass do interceptor postMoveFlow
-    let ida;
-    try {
-      ida = await moverPorCliques(gid, nome, gslId, gslNome);
-    } finally {
-      resetPendingMove();
+    // GATE 0: GD funcionalmente vazio (só ativas travam; históricas bcs='1' ignoradas)
+    const gdAtivasAntes = activeLines(gd);
+    const gdHistoricas = (gd.lines || []).length - gdAtivasAntes.length;
+    if (gdAtivasAntes.length > 0) {
+      return { halt: true, motivo: 'GD "' + gd.name + '" NÃO vazio (' + gdAtivasAntes.length + ' ativa[s]' + (gdHistoricas ? ' + ' + gdHistoricas + ' histórica[s]' : '') + ') — risco de MISTURA' };
     }
+    if (gdHistoricas > 0) log('  · GD "' + gd.name + '": ' + gdHistoricas + ' histórica[s] (bcs=1) ignoradas no GATE 0');
+
+    // ① IDA: origem → GD (100% cliques UI). GD não casa TARGET_DEST_PATTERN,
+    // então o interceptor NÃO dispara postMoveFlow — não precisa escudo.
+    log('  ═══ ① IDA: "' + nome + '" → GD (' + N + ' linha[s]) ═══', 'hl');
+    const ida = await moverPorCliques(gid, nome, gdid, gd.name);
     if (!ida.ok) return { halt: true, motivo: 'IDA falhou — ' + ida.motivo };
 
-    // GATE 1: todas no GRUPO SEM LINHAS + origem vazia
-    log('  · validando IDA (todas no "' + gslNome + '"? origem vazia?)…', 'hl');
-    const v1 = await validarRoundtrip(sess, gslId, msisdnsOrigem, N, gid);
+    log('  · validando IDA (todas no GD? origem vazia?)…', 'hl');
+    const v1 = await validarRoundtrip(sess, gdid, msisdnsOrigem, N, gid);
     if (!v1.ok) return { halt: true, motivo: 'IDA incompleta — ' + v1.motivo };
-    log('  ✓ IDA validada: ' + N + ' no "' + gslNome + '", origem vazia', 'ok');
+    log('  ✓ IDA validada: ' + N + ' no GD, origem vazia', 'ok');
 
-    // ── ② RESET + REAPPLY cota do grupo origem (origem vazia) ──
-    let reapplyOk = true;
-    if (cotaGrupoFrozen > 0) {
-      log('  · RESET · zerando cota do grupo origem [' + gid + ']…');
-      const rz = await trySetGroupQuota(gid, nome, 0);
-      if (rz.ok) log('  ✓ cota do grupo zerada', 'ok');
-      else       log('  ⚠ RESET não confirmado · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || ''), 'err');
-      await sleep(1500);
-
-      log('  · REAPLICANDO ' + cotaGrupoFrozen.toFixed(2) + ' GB no grupo origem [' + gid + ']…');
-      const rp = await trySetGroupQuota(gid, nome, cotaGrupoFrozen);
-      if (rp.ok) {
-        log('  ✓ cota do grupo reaplicada · sev=' + (rp.json?.severity || 'ok'), 'ok');
-      } else {
-        reapplyOk = false;
-        log('  ⛔ REAPLICAÇÃO FALHOU · sev=' + (rp.json?.severity || '?') + ' · result=' + (rp.json?.result || '') + ' — VOLTA ainda roda (linhas voltam), mas cota fica em 0. Corrija manual pelo portal Vivo (Editar grupo → ' + cotaGrupoFrozen.toFixed(2) + 'GB).', 'err');
-      }
-      await sleep(1000);
-    } else {
-      log('  ⏭ RESET/REAPLICAÇÃO pulados · cotaGrupoFrozen=0');
-    }
-
-    // ── ③ VOLTA: GRUPO SEM LINHAS → origem (escudo: pendingMove.active=true) ──
-    // Sempre roda, mesmo se REAPPLY falhou (garante linhas na origem).
+    // ② VOLTA: GD → origem (100% cliques UI)
     fecharModais(); colapsarGrupos(); await sleep(600);
-    log('  ═══ ③ VOLTA: "' + gslNome + '" → "' + nome + '" ═══', 'hl');
-    pendingMove.active = true;
-    let volta;
-    try {
-      volta = await moverPorCliques(gslId, gslNome, gid, nome);
-    } finally {
-      resetPendingMove();
-    }
-    if (!volta.ok) return { halt: true, motivo: 'VOLTA falhou — ' + volta.motivo + ' (linhas ficaram no "' + gslNome + '"!)' };
+    log('  ═══ ② VOLTA: GD → "' + nome + '" ═══', 'hl');
+    const volta = await moverPorCliques(gdid, gd.name, gid, nome);
+    if (!volta.ok) return { halt: true, motivo: 'VOLTA falhou — ' + volta.motivo + ' (linhas ficaram no GD!)' };
 
-    // GATE 2: todas de volta na origem + GRUPO SEM LINHAS vazio
-    log('  · validando VOLTA (todas de volta na origem? "' + gslNome + '" vazio?)…', 'hl');
-    const v2 = await validarRoundtrip(sess, gid, msisdnsOrigem, N, gslId);
+    log('  · validando VOLTA (todas de volta na origem? GD vazio?)…', 'hl');
+    const v2 = await validarRoundtrip(sess, gid, msisdnsOrigem, N, gdid);
     if (!v2.ok) return { halt: true, motivo: 'VOLTA incompleta — ' + v2.motivo };
-    log('  ✓ CONCILIAÇÃO: ' + N + ' de volta em "' + nome + '", "' + gslNome + '" vazio', 'ok');
+    log('  ✓ CONCILIAÇÃO: ' + N + ' de volta em "' + nome + '", GD vazio', 'ok');
 
-    return { ok: reapplyOk, N, cotaGrupoFrozen, motivo: reapplyOk ? null : 'linhas OK (voltaram), cota do grupo NÃO foi reaplicada (ficou 0)' };
+    return { ok: true, N };
   }
 
   /* ─────────────────────────────────────────────────────────
@@ -1589,16 +1612,8 @@ CHANGELOG v9.0.0
             parou = true;
             break;
           }
-          // v9.9.4: linhas voltaram OK, mas REAPPLY pode ter falhado — conta como fail
-          // mas SEGUE o batch (não é halt, as linhas estão seguras na origem).
-          if (rt.ok === false) {
-            fail++;
-            log('  ⚠ ilimitado PARCIAL · ' + rt.N + ' linha(s) OK, ' + rt.motivo, 'err');
-            log('  ⚠ AÇÃO NECESSÁRIA: abra o portal Vivo, edite o grupo "' + nome + '" e defina cota=' + (rt.cotaGrupoFrozen || 0).toFixed(2) + 'GB', 'err');
-          } else {
-            ok++;
-            log('  ✅ ilimitado concluído · ' + rt.N + ' linha(s) · cota grupo=' + (rt.cotaGrupoFrozen || 0).toFixed(2) + 'GB reaplicada · round-trip validado', 'ok');
-          }
+          ok++;
+          log('  ✅ ilimitado concluído · ' + rt.N + ' linha(s) · round-trip validado (sem tocar em cota)', 'ok');
           setProgresso(i + 1, total, i + 1 === total ? 'Concluído.' : 'Próximo…');
           fecharModais(); colapsarGrupos(); await sleep(1200);
           continue;
@@ -2346,7 +2361,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v9.10.0 (ilimitado: IDA GSL → RESET+REAPPLY → VOLTA · sem GD) carregado', 'ok');
+    log('✅ MoveLines + Cota v9.11.0 (ilimitado: só roundtrip pelo GD · sem tocar em cota) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
