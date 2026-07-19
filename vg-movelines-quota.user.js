@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.9.2
+// @version      9.9.3
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,36 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.9.3 — REAPLICAÇÃO volta pra depois da VOLTA (limite Vivo)
+─────────────────────────────────────────────────────────────
+v9.9.2 quebrou: log mostrou setGroupQuota(gid, 900GB) → HTTP 500 sev=error
+executado entre RESET e VOLTA (grupo com 0 linhas ativas).
+
+Workflow multi-agente (3 agentes) confirmou causa raiz: **Vivo REJEITA
+setGroupQuota(gid, N>0) quando grupo tem 0 linhas ativas.** RESET → 0
+passa (idempotente). REAPPLY em grupo vazio bate na validação server-side.
+Não é lag — aumentar sleep/retry não resolve.
+
+Tabela do que Vivo aceita:
+  Estado grupo         setGroupQuota(0)   setGroupQuota(>0)
+  0 linhas (vazio)     200 OK              HTTP 500
+  N linhas             200 OK              200 OK
+
+Fix: mover REAPLICAÇÃO pra DEPOIS da VOLTA (ordem ui2ui, comprovada em prod).
+
+Nova ordem em roundtripIlimitado:
+   0. Congela cotaGrupoFrozen
+   1. IDA origem → GD (100% UI)
+   2. Valida IDA
+   3. RESET cota grupo origem → 0    (grupo vazio; 200 OK)
+   4. VOLTA GD → origem (100% UI)
+   5. Valida VOLTA (grupo agora tem linhas)
+   6. REAPLICA cota grupo = cotaGrupoFrozen    (linhas dentro; 200 OK)
+
+Janela residual grupo-tem-linhas-cota=0: subsegundos entre passo 5 e 6,
+sem chamada de rede intermediária consumindo. Padrão ui2ui há tempos
+sem incidente.
+
 CHANGELOG v9.9.2 — Reordena reset+reaplicação ANTES da volta
 ─────────────────────────────────────────────────────────────
 Naldo (19/07/26 12:23): reset e reaplicação da cota do grupo devem
@@ -1263,24 +1293,17 @@ CHANGELOG v9.0.0
     if (!v1.ok) return { halt: true, motivo: 'IDA incompleta — ' + v1.motivo };
     log('  ✓ IDA validada: ' + N + ' no GD, origem vazia', 'ok');
 
-    // ③ RESET + REAPLICAÇÃO da cota do grupo (com origem VAZIA, antes da volta)
-    // Naldo (19/07/26 12:23): reset e reaplicação DEVEM acontecer ANTES da volta,
-    // com a origem ainda vazia. Objetivo: restaurar a franquia antes das linhas
-    // retornarem — evita janela onde grupo tem linhas mas cota=0.
+    // ③ RESET cota grupo origem (origem vazia — libera cota pro pool GD)
+    // v9.9.3: só o RESET vai aqui. REAPLICAÇÃO fica pra depois da VOLTA porque
+    // Vivo rejeita HTTP 500 setGroupQuota(gid, >0) em grupo com 0 linhas ativas.
     if (cotaGrupoFrozen > 0) {
       log('  · RESET · zerando cota do grupo origem [' + gid + '] (libera ' + cotaGrupoFrozen.toFixed(2) + ' GB pro GD)…');
       const rz = await trySetGroupQuota(gid, nome, 0);
       if (rz.ok) log('  ✓ cota do grupo zerada', 'ok');
-      else       log('  ⚠ RESET não confirmado · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || '') + ' — reaplicação ainda tenta', 'err');
+      else       log('  ⚠ RESET não confirmado · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || '') + ' — reaplicação após VOLTA ainda tenta', 'err');
       await sleep(1500);
-
-      log('  · REAPLICANDO ' + cotaGrupoFrozen.toFixed(2) + ' GB no grupo origem [' + gid + ']…');
-      const rp = await trySetGroupQuota(gid, nome, cotaGrupoFrozen);
-      if (rp.ok) log('  ✓ cota do grupo reaplicada · sev=' + (rp.json?.severity || 'ok'), 'ok');
-      else       log('  ⚠ REAPLICAÇÃO FALHOU · sev=' + (rp.json?.severity || '?') + ' · result=' + (rp.json?.result || '') + ' — reaplicar manualmente', 'err');
-      await sleep(1000);
     } else {
-      log('  ⏭ RESET/REAPLICAÇÃO pulados · cotaGrupoFrozen=0 (grupo sem cota registrada)');
+      log('  ⏭ RESET pulado · cotaGrupoFrozen=0 (grupo sem cota registrada)');
     }
 
     // ② VOLTA: GD → origem (100% UI)
@@ -1294,6 +1317,19 @@ CHANGELOG v9.0.0
     const v2 = await validarRoundtrip(sess, gid, msisdnsOrigem, N, gdid);
     if (!v2.ok) return { halt: true, motivo: 'VOLTA incompleta — ' + v2.motivo };
     log('  ✓ CONCILIAÇÃO: ' + N + ' de volta na origem "' + nome + '", GD vazio', 'ok');
+
+    // ④ REAPLICAÇÃO da cota do grupo (só agora, com linhas já dentro do grupo)
+    // v9.9.3: Vivo aceita setGroupQuota(gid, >0) apenas se grupo tem linhas ativas.
+    // Padrão do ui2ui, comprovado em produção. Janela residual grupo-com-linhas-cota=0:
+    // subsegundos entre este passo e o anterior, sem chamada de rede consumindo.
+    if (cotaGrupoFrozen > 0) {
+      log('  · REAPLICANDO ' + cotaGrupoFrozen.toFixed(2) + ' GB no grupo origem [' + gid + ']…');
+      const rp = await trySetGroupQuota(gid, nome, cotaGrupoFrozen);
+      if (rp.ok) log('  ✓ cota do grupo reaplicada · sev=' + (rp.json?.severity || 'ok'), 'ok');
+      else       log('  ⚠ REAPLICAÇÃO FALHOU · sev=' + (rp.json?.severity || '?') + ' · result=' + (rp.json?.result || '') + ' — reaplicar manualmente pelo portal', 'err');
+    } else {
+      log('  ⏭ REAPLICAÇÃO pulada · cotaGrupoFrozen=0');
+    }
 
     return { ok: true, N, cotaGrupoFrozen };
   }
@@ -2213,7 +2249,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v9.9.2 (ilimitado: reset+reaplica ANTES da volta) carregado', 'ok');
+    log('✅ MoveLines + Cota v9.9.3 (ilimitado: reset antes / reaplica após volta) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
