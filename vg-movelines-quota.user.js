@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.8.0
+// @version      9.8.1
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
 // @author       Naldo Nascimento
-// @match        https://vivogestao.vivoempresas.com.br/Portal/data/consumption*
+// @match        https://vivogestao.vivoempresas.com.br/Portal/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      script.google.com
@@ -15,6 +15,26 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.8.1 — Ajustes solicitados pelo Naldo (19/07/26, 11:22)
+─────────────────────────────────────────────────────────────
+1. HERANÇA UNIFICADA (normal + ilimitado)
+   Correção do 9.8.0: no ilimitado, só rename não bastava — a cota do
+   GRUPO precisa ser transferida também. Diferença é SÓ a cota individual
+   das linhas.
+   Novo dispatcher:
+     • Normal → postMoveFlowHeranca(true)   → aplica cota nas linhas
+     • Ilimitado → postMoveFlowHeranca(false) → pula applyQuotaToLines
+   Herança da cota do grupo (RESET origem + setGroup destino + micro-gates)
+   roda em AMBOS. Fluxo postMoveFlowIlimitado removido (código duplicado).
+
+2. @match restaurado + guarda RUNTIME
+   Antes: @match .../Portal/data/consumption* (não carregava)
+   Agora: @match .../Portal/* + check em init() se location.pathname
+          starts with /Portal/data/consumption. Sai silencioso em
+          outras páginas do portal.
+   Motivo: wildcard restritivo tava impedindo o script de carregar.
+   Guarda runtime é mais previsível.
+
 CHANGELOG v9.8.0 — 3 ajustes solicitados pelo Naldo (19/07/26)
 ─────────────────────────────────────────────────────────────
 1. @match RESTRITO à página de renovação
@@ -703,53 +723,23 @@ CHANGELOG v9.0.0
     const destIlim = isIlimitado(destinoName);
 
     if (origemIlim || destIlim) {
-      log('  · rota ILIMITADO detectada (origem_ilim=' + origemIlim + ' · destino_ilim=' + destIlim + ') → só rename (sem cota, sem GD)');
-      await postMoveFlowIlimitado();
+      log('  · rota ILIMITADO (origem_ilim=' + origemIlim + ' · destino_ilim=' + destIlim + ') → herança de cota do grupo · SEM cota individual das linhas');
+      await postMoveFlowHeranca(false); // aplicaCotaLinhas=false
     } else {
-      log('  · rota NORMAL→NORMAL → herança 3-em-3');
-      await postMoveFlowHeranca();
+      log('  · rota NORMAL→NORMAL → herança 3-em-3 completa (cota do grupo + cota individual das linhas)');
+      await postMoveFlowHeranca(true);  // aplicaCotaLinhas=true
     }
   }
 
-  /* v9.8.0 — ILIMITADO: só rename, sem cota
-   * Naldo (19/07/26): a herança da cota do GD estava zerando linhas de
-   * ilimitado por conflito. Removida a consulta ao GD (findGdGroup) e
-   * o setGroupQuota. Comportamento igual ao ui2ui: só troca de nome
-   * (destino ← origem, origem ← "GRUPO SEM LINHAS"). Linhas ficam sem
-   * cota individual (uso livre — payload sem quota/futureQuota).
+  /* v9.8.1 — HERANÇA UNIFICADA
+   *   • Ordem RESET-first: libera cota da origem pro pool GD ANTES do setDest
+   *     (evita HTTP 500 em contas com GD apertado — matemática de conservação).
+   *   • Flag aplicaCotaLinhas: NORMAL=true (faz applyQuotaToLines),
+   *     ILIMITADO=false (pula — linhas ficam em "uso livre", igual ao ui2ui).
+   *   • A herança da COTA DO GRUPO (RESET origem + setGroup destino) roda em
+   *     AMBOS os casos. Só o CAP das linhas diverge.
    */
-  async function postMoveFlowIlimitado() {
-    const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
-
-    // Rename destino → nome da origem [R1]
-    if (isCfg('renomear')) {
-      try {
-        atualizarStatusUI('Renomeando destino → "' + sourceGroupName + '"…');
-        log('  · renomeando destino [' + destGroupId + '] → "' + sourceGroupName + '" [R1]');
-        await renameGroup(destGroupId, sourceGroupName);
-        log('  ✓ destino renomeado', 'ok');
-      } catch (err) { log('  ⚠ renomeio destino falhou: ' + err.message, 'err'); }
-
-      // Rename origem → "GRUPO SEM LINHAS"
-      try {
-        atualizarStatusUI('Renomeando origem → "GRUPO SEM LINHAS"…');
-        log('  · renomeando origem [' + sourceGroupId + '] → "GRUPO SEM LINHAS"');
-        await renameGroup(sourceGroupId, CFG.EMPTY_NAME);
-        log('  ✓ origem renomeada', 'ok');
-      } catch (err) { log('  ⚠ renomeio origem falhou: ' + err.message, 'err'); }
-    }
-
-    log('  ✅ ilimitado concluído · ' + sourceGroupName + ' · ' + lines.length + ' linha(s) sem cota individual (uso livre)', 'ok');
-    finalizarPostMove(true);
-  }
-
-  /* v9.7.2 — HERANÇA 3-em-3 (só grupos NORMAIS)
-   * Ordem RESET-FIRST: libera cota da origem pro pool GD ANTES de
-   * atribuir ao destino. Sem isso, contas com GD apertado falham
-   * HTTP 500 no setGroupQuota(dest, X) porque X GB ainda estão
-   * presos na origem — matemática de conservação da cota.
-   */
-  async function postMoveFlowHeranca() {
+  async function postMoveFlowHeranca(aplicaCotaLinhas) {
     const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
     let cotaSuficiente = true;
 
@@ -833,12 +823,14 @@ CHANGELOG v9.0.0
       }
     }
 
-    // ── ETAPA 5: applyQuotaToLines [R3] ──
-    if (isCfg('aplicarCota') && lines.length > 0 && perLine !== null) {
+    // ── ETAPA 5: applyQuotaToLines [R3] · SÓ pra grupos NORMAIS ──
+    if (isCfg('aplicarCota') && lines.length > 0 && perLine !== null && aplicaCotaLinhas) {
       log('  · applyQuotaToLines · ' + lines.length + ' linha(s) · ' + perLine + ' GB por linha… [R3]');
       const rl = await applyQuotaToLines(destGroupId, perLine, lines);
       if (rl.ok) log('  ✓ cota individual aplicada', 'ok');
       else       { log('  ⚠ applyQuotaToLines FALHOU · sev=' + (rl.json?.severity || '?') + ' · result=' + (rl.json?.result || ''), 'err'); cotaSuficiente = false; }
+    } else if (!aplicaCotaLinhas && lines.length > 0) {
+      log('  · applyQuotaToLines pulado · grupo ILIMITADO — linhas em uso livre da cota do grupo');
     }
 
     // ── ETAPA 6: renameGroup(dest, sourceName) [R1] ──
@@ -861,7 +853,10 @@ CHANGELOG v9.0.0
       } catch (err) { log('  ⚠ renomeio origem falhou: ' + err.message, 'err'); }
     }
 
-    log('  ✅ herança concluída · ' + sourceGroupName + ' · grupo=' + originTotalFrozen.toFixed(2) + 'GB · ' + lines.length + '× ' + perLine + 'GB', 'ok');
+    const suffix = aplicaCotaLinhas
+      ? (lines.length + '× ' + perLine + 'GB')
+      : (lines.length + ' linha(s) em uso livre');
+    log('  ✅ herança concluída · ' + sourceGroupName + ' · grupo=' + originTotalFrozen.toFixed(2) + 'GB · ' + suffix, 'ok');
     finalizarPostMove(cotaSuficiente);
   }
 
@@ -1990,14 +1985,25 @@ CHANGELOG v9.0.0
   /* ─────────────────────────────────────────────────────────
    *  BOOT
    * ───────────────────────────────────────────────────────── */
+  // v9.8.1 — só ativa na área de renovação (data/consumption). @match ficou
+  // permissivo em /Portal/* porque o wildcard restritivo estava impedindo
+  // o carregamento; a checagem exata mora aqui, no runtime.
+  const URL_RENOVACAO_PATH = '/Portal/data/consumption';
+  function estaNaRenovacao() {
+    try { return (location.pathname || '').startsWith(URL_RENOVACAO_PATH); }
+    catch (_) { return false; }
+  }
+
   function init() {
+    if (!estaNaRenovacao()) return; // sai silencioso em outras páginas do portal
+
     setupLogoutDetection();
     observeAngular();
     setTimeout(() => { if (isCfg('colorir')) restoreColors(); }, 300);
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v9.8.0 (herança 3-em-3 · RESET-first · ilimitado simplificado) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
+    log('✅ MoveLines + Cota v9.8.1 (herança unificada) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
