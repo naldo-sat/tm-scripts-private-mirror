@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.7.2
+// @version      9.8.0
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
 // @author       Naldo Nascimento
-// @match        https://vivogestao.vivoempresas.com.br/Portal/*
+// @match        https://vivogestao.vivoempresas.com.br/Portal/data/consumption*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      script.google.com
@@ -15,6 +15,35 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.8.0 — 3 ajustes solicitados pelo Naldo (19/07/26)
+─────────────────────────────────────────────────────────────
+1. @match RESTRITO à página de renovação
+   • Antes: /Portal/*
+   • Agora: /Portal/data/consumption*
+   • Motivo: script não deve rodar em outras páginas do portal Vivo.
+
+2. WATCHDOG DE TROCA DE CONTA
+   • montarLista registra `contaCarregada` (via obterContaAtiva)
+   • setInterval(3s) compara conta ativa vs contaCarregada.
+     Se mudar, limpa gruposCache + avisa "pressione F5 e Carregar".
+   • executarLote ganhou trava: se conta atual != contaCarregada, aborta.
+   • Objetivo: nunca rodar batch com lista da conta errada. Naldo
+     precisa dar F5 manualmente após trocar de conta (garante sessão
+     limpa; não forço reload automático).
+
+3. ILIMITADO SIMPLIFICADO (removido consulta ao GD)
+   • Bug: cota estava sendo zerada nas linhas de ilimitado por conflito
+     com a regra de herança do GD (findGdGroup + unallocatedQuota).
+   • Fluxo v9.6.2 legado (postMoveFlowLegado) REMOVIDO inteiro.
+   • Nova postMoveFlowIlimitado: só faz rename destino→sourceName e
+     origem→"GRUPO SEM LINHAS". Sem setGroupQuota, sem applyQuotaToLines,
+     sem findGdGroup. Linhas ficam em uso livre (comportamento ui2ui).
+   • Checkbox "Aplicar cota nas linhas ilimitadas" REMOVIDO do painel.
+
+Total: postMoveFlowLegado (~94 linhas) removida; postMoveFlowIlimitado
+(~25 linhas) adicionada. Redução líquida de código + comportamento mais
+previsível pra ilimitados.
+
 CHANGELOG v9.7.2 — FIX CRÍTICO ordem RESET-first (GD apertado)
 ─────────────────────────────────────────────────────────────
 Bug: em contas com pool GD (unallocatedQuota) apertado, o ciclo 2+
@@ -311,7 +340,6 @@ CHANGELOG v9.0.0
    *  v9.0.0 — CHECKBOXES DE CONFIGURAÇÃO (persistidos)
    * ───────────────────────────────────────────────────────── */
   const CFG_UI = {
-    ilim:            { key: 'mlq_aplicar_ilim',   label: 'Aplicar cota nas linhas ilimitadas', default: false, tip: 'Refere-se apenas à cota INDIVIDUAL das linhas (saveLines). A cota do GRUPO destino sempre é aplicada (recebe toda a cota disponível do GD). MARCADO: também distribui cota linha-a-linha. DESMARCADO (padrão): linhas ficam sem cota individual (uso livre da cota do grupo).' },
     colorir:         { key: 'mlq_colorir',        label: 'Colorir linhas concluídas',          default: true,  tip: 'Marca em VERDE a linha do grupo destino quando tudo dá certo, ou VERMELHO quando falta cota. Persiste 20h no localStorage.' },
     gravarPlanilha:  { key: 'mlq_gravar_planilha',label: 'Gravação na planilha',               default: true,  tip: 'Grava na planilha do Acessos VG o status do lote: início ("Renovando...") e fim ("OK: X/N | HH:MM — duração"). Precisa da conta ativa detectada e mapeada. DESMARCADO: nenhuma chamada ao Apps Script.' },
   };
@@ -675,12 +703,44 @@ CHANGELOG v9.0.0
     const destIlim = isIlimitado(destinoName);
 
     if (origemIlim || destIlim) {
-      log('  · rota ILIMITADO detectada (origem_ilim=' + origemIlim + ' · destino_ilim=' + destIlim + ') → fluxo v9.6.2 legado');
-      await postMoveFlowLegado(origemIlim);
+      log('  · rota ILIMITADO detectada (origem_ilim=' + origemIlim + ' · destino_ilim=' + destIlim + ') → só rename (sem cota, sem GD)');
+      await postMoveFlowIlimitado();
     } else {
       log('  · rota NORMAL→NORMAL → herança 3-em-3');
       await postMoveFlowHeranca();
     }
+  }
+
+  /* v9.8.0 — ILIMITADO: só rename, sem cota
+   * Naldo (19/07/26): a herança da cota do GD estava zerando linhas de
+   * ilimitado por conflito. Removida a consulta ao GD (findGdGroup) e
+   * o setGroupQuota. Comportamento igual ao ui2ui: só troca de nome
+   * (destino ← origem, origem ← "GRUPO SEM LINHAS"). Linhas ficam sem
+   * cota individual (uso livre — payload sem quota/futureQuota).
+   */
+  async function postMoveFlowIlimitado() {
+    const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
+
+    // Rename destino → nome da origem [R1]
+    if (isCfg('renomear')) {
+      try {
+        atualizarStatusUI('Renomeando destino → "' + sourceGroupName + '"…');
+        log('  · renomeando destino [' + destGroupId + '] → "' + sourceGroupName + '" [R1]');
+        await renameGroup(destGroupId, sourceGroupName);
+        log('  ✓ destino renomeado', 'ok');
+      } catch (err) { log('  ⚠ renomeio destino falhou: ' + err.message, 'err'); }
+
+      // Rename origem → "GRUPO SEM LINHAS"
+      try {
+        atualizarStatusUI('Renomeando origem → "GRUPO SEM LINHAS"…');
+        log('  · renomeando origem [' + sourceGroupId + '] → "GRUPO SEM LINHAS"');
+        await renameGroup(sourceGroupId, CFG.EMPTY_NAME);
+        log('  ✓ origem renomeada', 'ok');
+      } catch (err) { log('  ⚠ renomeio origem falhou: ' + err.message, 'err'); }
+    }
+
+    log('  ✅ ilimitado concluído · ' + sourceGroupName + ' · ' + lines.length + ' linha(s) sem cota individual (uso livre)', 'ok');
+    finalizarPostMove(true);
   }
 
   /* v9.7.2 — HERANÇA 3-em-3 (só grupos NORMAIS)
@@ -805,100 +865,6 @@ CHANGELOG v9.0.0
     finalizarPostMove(cotaSuficiente);
   }
 
-  /* v9.6.2 preservado (branch ILIMITADO): RESET-first, cota via GD ou origem */
-  async function postMoveFlowLegado(ilim) {
-    const { sourceGroupId, sourceGroupName, destGroupId, lines } = pendingMove;
-
-    // ── ETAPA 0: captura cotas atuais (destino + origem) ──
-    const destAvail   = await fetchDestGroupQuota(destGroupId) || getAvailableQuota(destGroupId);
-    const cacheOrigem = groupQuotaCache[String(sourceGroupId)] || {};
-    const originTotal = parseFloat(cacheOrigem.total) || getAvailableQuota(sourceGroupId) || 0;
-    log('  [DBG] cotas capturadas · destino_avail=' + destAvail.toFixed(2) + ' GB · origem_TOTAL=' + originTotal.toFixed(2) + ' GB', 'dbg');
-
-    // ── ETAPA 1a: RESET cota da origem ──
-    if (isCfg('aplicarCota') && originTotal > 0) {
-      atualizarStatusUI('Zerando cota da origem…');
-      log('  · RESET · zerando cota da origem [' + sourceGroupId + '] (libera ' + originTotal.toFixed(2) + ' GB)…');
-      const rz = await trySetGroupQuota(sourceGroupId, sourceGroupName, 0);
-      if (rz.ok) log('  ✓ cota da origem zerada', 'ok');
-      else       log('  ⚠ RESET falhou · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || ''), 'err');
-      await sleep(600);
-    }
-
-    // ── ETAPA 1b/1c: Renomeios ──
-    if (isCfg('renomear')) {
-      try {
-        atualizarStatusUI('Renomeando origem → "GRUPO SEM LINHAS"…');
-        log('  · renomeando origem [' + sourceGroupId + '] → "GRUPO SEM LINHAS"');
-        await renameGroup(sourceGroupId, CFG.EMPTY_NAME);
-        log('  ✓ origem renomeada', 'ok');
-      } catch (err) { log('  ⚠ renomeio origem falhou: ' + err.message, 'err'); }
-      try {
-        atualizarStatusUI('Renomeando destino → "' + sourceGroupName + '"…');
-        log('  · renomeando destino [' + destGroupId + '] → "' + sourceGroupName + '"');
-        await renameGroup(destGroupId, sourceGroupName);
-        log('  ✓ destino renomeado', 'ok');
-      } catch (err) { log('  ⚠ renomeio destino falhou: ' + err.message, 'err'); }
-    }
-
-    // ── ETAPA 2: Cota no destino ──
-    let cotaSuficiente = true;
-    if (isCfg('aplicarCota')) {
-      atualizarStatusUI('Aplicando cota no destino…');
-      let quotaGrupoDest = 0, origemLabel = '';
-      if (ilim) {
-        await fetchDestGroupQuota(destGroupId);
-        const gd = findGdGroup([String(sourceGroupId), String(destGroupId)]);
-        if (gd) {
-          quotaGrupoDest = parseFloat((groupQuotaCache[String(gd.id)] || {}).available) || 0;
-          origemLabel = 'GD "' + gd.name + '" [' + gd.id + '] · disponível=' + quotaGrupoDest.toFixed(2) + ' GB';
-        } else {
-          quotaGrupoDest = originTotal;
-          origemLabel = 'origem (fallback · GD não achado) · ' + originTotal.toFixed(2) + ' GB';
-        }
-      } else {
-        quotaGrupoDest = originTotal;
-        origemLabel = 'origem (transferência 1:1) · ' + originTotal.toFixed(2) + ' GB';
-        if (!quotaGrupoDest) {
-          const pl = extractQuotaFromGroupName(sourceGroupName);
-          if (pl && lines.length) { quotaGrupoDest = pl * lines.length; origemLabel = 'nome (fallback) · ' + pl + ' × ' + lines.length; }
-        }
-      }
-      log('  [DBG] cota grupo destino = ' + quotaGrupoDest.toFixed(2) + ' GB · origem: ' + origemLabel, 'dbg');
-
-      if (quotaGrupoDest > 0) {
-        log('  · aplicando ' + quotaGrupoDest.toFixed(2) + ' GB no destino [' + destGroupId + ']…');
-        const r = await trySetGroupQuota(destGroupId, sourceGroupName, quotaGrupoDest);
-        if (r.ok) {
-          log('  ✓ cota do grupo aplicada · sev=' + (r.json?.severity || 'ok'), 'ok');
-          if (lines.length > 0) {
-            const aplicaCotaIndividual = !ilim || isCfg('ilim');
-            let quotaPerLine = null;
-            if (aplicaCotaIndividual) {
-              const nominal = extractQuotaFromGroupName(sourceGroupName) || (quotaGrupoDest / lines.length);
-              const capMax  = Math.floor((quotaGrupoDest / lines.length) * 100) / 100;
-              if (nominal > capMax) { log('  ⚠ nominal ' + nominal + 'GB × ' + lines.length + ' estoura ' + quotaGrupoDest.toFixed(2) + 'GB · CAP ' + capMax + 'GB/linha', 'hl'); quotaPerLine = capMax; }
-              else                  { quotaPerLine = nominal; }
-            }
-            log('  · applyQuotaToLines · ' + lines.length + ' linha(s) · ' + (aplicaCotaIndividual ? (quotaPerLine + ' GB por linha') : 'SEM cota individual (uso livre)') + '…');
-            const rl = await applyQuotaToLines(destGroupId, quotaPerLine, lines);
-            if (rl.ok) log('  ✓ ' + (aplicaCotaIndividual ? 'cota individual aplicada' : 'linhas liberadas para uso livre'), 'ok');
-            else       { log('  ⚠ applyQuotaToLines FALHOU · sev=' + (rl.json?.severity || '?') + ' · result=' + (rl.json?.result || ''), 'err'); cotaSuficiente = false; }
-          }
-          log('  ✅ concluído · ' + sourceGroupName + ' · grupo=' + quotaGrupoDest.toFixed(2) + 'GB' + (ilim ? ' (do GD)' : ' (da origem)'), 'ok');
-        } else {
-          cotaSuficiente = false;
-          log('  ⚠ trySetGroupQuota FALHOU · sev=' + (r.json?.severity || '?') + ' · result=' + (r.json?.result || 'sem detalhes'), 'err');
-        }
-      } else {
-        log('  ⏭ sem cota pra aplicar · quotaGrupoDest=0');
-      }
-    } else {
-      log('  ⏭ aplicação de cota DESATIVADA (checkbox)');
-    }
-
-    finalizarPostMove(cotaSuficiente);
-  }
 
   function finalizarPostMove(cotaSuficiente) {
     const { destGroupId } = pendingMove;
@@ -1186,19 +1152,29 @@ CHANGELOG v9.0.0
   /* ─────────────────────────────────────────────────────────
    *  v9.1.0 — LISTA DE GRUPOS + EXECUÇÃO EM LOTE
    * ───────────────────────────────────────────────────────── */
-  let gruposCache = [];
-  let executando  = false;
+  let gruposCache   = [];
+  let contaCarregada = null;  // v9.8.0 — conta cujos grupos estão no gruposCache
+  let executando    = false;
+
+  // v9.8.0 — invalida lista quando conta ativa muda vs a que carregou a lista
+  function limparListaComAviso(listEl, motivoHtml) {
+    gruposCache = [];
+    contaCarregada = null;
+    if (listEl) listEl.innerHTML = '<div class="mlq-g" style="color:#dc2626">' + motivoHtml + '</div>';
+  }
 
   async function montarLista(listEl) {
     listEl.innerHTML = '<div class="mlq-g" style="color:#94a3b8">carregando grupos…</div>';
     try {
       const sess = getUiSession();
       if (!sess) { listEl.innerHTML = '<div class="mlq-g" style="color:#dc2626">sessão não encontrada — recarregue logado</div>'; return; }
+      const contaAtual = obterContaAtiva();
       const all = await loadViewUI(sess);
       gruposCache = all
         .filter(g => numerado_ui(g) && !ehGD_ui(g) && !CFG.TARGET_DEST_PATTERN.test(g.name || ''))
         .map(g => ({ id: String(g.id), name: g.name, n: (g.lines || []).length }))
         .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'pt', { numeric: true }));
+      contaCarregada = contaAtual;
       if (!gruposCache.length) { listEl.innerHTML = '<div class="mlq-g">nenhum grupo numerado</div>'; return; }
       listEl.innerHTML = '';
       for (const g of gruposCache) {
@@ -1208,10 +1184,26 @@ CHANGELOG v9.0.0
         row.querySelector('.nm').textContent = g.name;
         listEl.appendChild(row);
       }
-      log('lista carregada · ' + gruposCache.length + ' grupo(s)', 'hl');
+      log('lista carregada · ' + gruposCache.length + ' grupo(s)' + (contaCarregada ? ' · conta ' + contaCarregada : ''), 'hl');
     } catch (e) {
       listEl.innerHTML = '<div class="mlq-g" style="color:#dc2626">erro: ' + (e && e.message || e) + '</div>';
     }
+  }
+
+  // v9.8.0 — polling leve pra detectar troca de conta enquanto o painel está aberto.
+  // Só limpa a lista se JÁ havia grupos carregados (contaCarregada != null) e a conta mudou.
+  // NÃO faz reload automático (Naldo faz F5 manual pra garantir sessão limpa).
+  function iniciarWatchdogConta() {
+    setInterval(() => {
+      if (executando) return; // não interfere durante batch
+      if (!contaCarregada) return; // nada pra invalidar
+      const atual = obterContaAtiva();
+      if (atual && atual !== contaCarregada) {
+        const listEl = document.getElementById('mlq-list');
+        log('⚠ conta mudou · lista era da ' + contaCarregada + ', agora ' + atual + ' — pressione F5 e recarregue', 'err');
+        limparListaComAviso(listEl, '⚠ conta mudou (' + contaCarregada + ' → ' + atual + ')<br>Pressione <b>F5</b> pra sincronizar, depois clique em <b>Carregar</b>.');
+      }
+    }, 3000);
   }
 
   function setProgresso(feitos, total, nomeAtual) {
@@ -1232,6 +1224,12 @@ CHANGELOG v9.0.0
     if (!marcados.length) { log('marque ao menos 1 grupo.', 'err'); return; }
     const sess = getUiSession();
     if (!sess) { log('sessão não encontrada — recarregue logado.', 'err'); return; }
+    // v9.8.0 — trava anti-mistura: conta ativa precisa bater com a que carregou a lista
+    const contaAtual = obterContaAtiva();
+    if (contaCarregada && contaAtual && contaAtual !== contaCarregada) {
+      log('⛔ conta mudou · lista era da ' + contaCarregada + ', agora ' + contaAtual + '. Pressione F5 e recarregue antes de rodar.', 'err');
+      return;
+    }
 
     executando = true;
     const goBtn = document.getElementById('mlq-go');
@@ -1998,7 +1996,8 @@ CHANGELOG v9.0.0
     setTimeout(() => { if (isCfg('colorir')) restoreColors(); }, 300);
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
-    log('✅ MoveLines + Cota v9.7.2 (herança 3-em-3 · RESET-first) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
+    iniciarWatchdogConta();
+    log('✅ MoveLines + Cota v9.8.0 (herança 3-em-3 · RESET-first · ilimitado simplificado) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
