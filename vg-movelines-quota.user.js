@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.9.4
+// @version      9.9.5
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,32 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.9.5 — Ordem final aprovada: IDA → RESET+REAPPLY → VOLTA
+─────────────────────────────────────────────────────────────
+Naldo (19/07/26 12:58): mover PRIMEIRO pro GD, RESET+REAPPLY do grupo
+origem enquanto linhas estão no GD, DEPOIS devolver.
+
+v9.9.2 já tentou essa ordem mas quebrou porque as linhas no GD carregam
+cota individual (~805GB) → pool GD fica travado → REAPPLY 900 GB dá 500.
+
+Fix v9.9.5: entre IDA e RESET, liberar cota individual das linhas no GD
+via applyQuotaToLines(gdid, null, linhasNoGd). Pool ganha ~805GB de
+volta antes do RESET/REAPPLY.
+
+Nova ordem (final):
+   0. Congela cotaGrupoFrozen (cache pré-move)
+   1. IDA origem → GD (100% UI)
+   2. Valida IDA
+   3. Libera cota individual das linhas NO GD (saveLines quota=null)  [NOVO]
+   4. RESET cota grupo origem → 0
+   5. REAPPLY cota grupo origem → cotaGrupoFrozen
+   6. VOLTA GD → origem (100% UI) — SEMPRE roda, mesmo se REAPPLY falhou
+   7. Valida VOLTA
+
+Fallback: se REAPPLY falhar, VOLTA acontece mesmo assim (linhas voltam
+seguras); executarLote reporta como fail + log "AÇÃO NECESSÁRIA" com
+o valor pra restaurar manualmente pelo portal.
+
 CHANGELOG v9.9.4 — libera cota das linhas antes de REAPPLY + status honesto
 ─────────────────────────────────────────────────────────────
 v9.9.3 ainda quebrou: log 12:41:53 mostrou setGroupQuota(gid, 900) → 500
@@ -1265,19 +1291,17 @@ CHANGELOG v9.0.0
     return { ok: false, motivo: 'não confluiu em ' + Math.round(timeout / 1000) + 's (' + resumo + ')' };
   }
 
-  /* v9.9.1 — ROUNDTRIP ILIMITADO (base ui2ui + RESET/reaplicação da cota do GRUPO)
-     Naldo (19/07/26 12:13): quer que ilimitado TAMBÉM faça reset+reaplicação,
-     mas SÓ da cota do grupo (linhas continuam em uso livre — sem saveLines).
+  /* v9.9.5 — ROUNDTRIP ILIMITADO (ordem final aprovada pelo Naldo)
      Fluxo:
        0. Congela cotaGrupoFrozen (via cache)
        1. IDA origem → GD (100% cliques UI)
        2. Valida IDA
-       3. RESET cota grupo origem (trySetGroupQuota → 0)
-       4. VOLTA GD → origem (100% cliques UI)
-       5. Valida VOLTA
-       6. Reaplica cota grupo origem (trySetGroupQuota → cotaGrupoFrozen)
-     NÃO faz saveLines nas linhas (uso livre — decisão anterior do Naldo).
-     Retorna { ok, motivo, halt } — halt=true → interrompe o batch. */
+       3. Libera cota individual das linhas NO GD (uso livre) — libera pool GD
+       4. RESET cota grupo origem → 0
+       5. REAPPLY cota grupo origem → cotaGrupoFrozen (pool tem espaço)
+       6. VOLTA GD → origem (100% cliques UI)
+       7. Valida VOLTA
+     Retorna { ok, motivo, halt } — halt=true interrompe batch, ok=false só marca fail. */
   async function roundtripIlimitado(sess, gid, nome) {
     fecharModais(); colapsarGrupos(); await sleep(600);
 
@@ -1307,7 +1331,7 @@ CHANGELOG v9.0.0
     await fetchDestGroupQuota(gid); // popula cache com dados atuais
     const cacheOrigem = groupQuotaCache[String(gid)] || {};
     const cotaGrupoFrozen = parseFloat(cacheOrigem.total) || 0;
-    log('  · cotaGrupoFrozen=' + cotaGrupoFrozen.toFixed(2) + ' GB (será reaplicada após VOLTA)');
+    log('  · cotaGrupoFrozen=' + cotaGrupoFrozen.toFixed(2) + ' GB (RESET+REAPPLY após IDA, antes da VOLTA)');
 
     // GATE 0: GD funcionalmente vazio? (só ativas travam; históricas bcs='1' ignoradas)
     const gdAtivasAntes = activeLines(gd);
@@ -1328,24 +1352,50 @@ CHANGELOG v9.0.0
     if (!v1.ok) return { halt: true, motivo: 'IDA incompleta — ' + v1.motivo };
     log('  ✓ IDA validada: ' + N + ' no GD, origem vazia', 'ok');
 
-    // ③ RESET cota grupo origem (origem vazia — libera cota pro pool GD)
-    // v9.9.3: só o RESET vai aqui. REAPLICAÇÃO fica pra depois da VOLTA porque
-    // Vivo rejeita HTTP 500 setGroupQuota(gid, >0) em grupo com 0 linhas ativas.
+    // ③ LIBERA cota individual das linhas NO GD (uso livre)
+    // v9.9.5: com origem vazia + linhas no GD com cota individual (~35GB × 23 = ~805GB),
+    // o pool GD fica travado. Zerar cota individual das linhas dentro do GD libera o
+    // pool antes do REAPPLY do grupo origem.
+    let reapplyOk = true;
     if (cotaGrupoFrozen > 0) {
+      const gdView = await loadViewUI(sess);
+      const gdFresh = gdView.find(x => String(x.id) === String(gdid));
+      const linhasNoGd = activeLines(gdFresh || {});
+      if (linhasNoGd.length) {
+        log('  · liberando cota individual das ' + linhasNoGd.length + ' linhas no GD (uso livre)…');
+        const rl = await applyQuotaToLines(gdid, null, linhasNoGd);
+        if (rl.ok) log('  ✓ linhas no GD liberadas · pool GD com espaço', 'ok');
+        else       log('  ⚠ saveLines(quota=null) no GD falhou · sev=' + (rl.json?.severity || '?') + ' — REAPPLY pode falhar por falta de pool', 'err');
+        await sleep(1200);
+      }
+
+      // ④ RESET cota grupo origem → 0 (origem vazia · devolve 900GB pro pool)
       log('  · RESET · zerando cota do grupo origem [' + gid + '] (libera ' + cotaGrupoFrozen.toFixed(2) + ' GB pro GD)…');
       const rz = await trySetGroupQuota(gid, nome, 0);
       if (rz.ok) log('  ✓ cota do grupo zerada', 'ok');
-      else       log('  ⚠ RESET não confirmado · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || '') + ' — reaplicação após VOLTA ainda tenta', 'err');
+      else       log('  ⚠ RESET não confirmado · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || ''), 'err');
       await sleep(1500);
+
+      // ⑤ REAPPLY cota grupo origem = cotaGrupoFrozen (pool agora tem espaço)
+      log('  · REAPLICANDO ' + cotaGrupoFrozen.toFixed(2) + ' GB no grupo origem [' + gid + ']…');
+      const rp = await trySetGroupQuota(gid, nome, cotaGrupoFrozen);
+      if (rp.ok) {
+        log('  ✓ cota do grupo reaplicada · sev=' + (rp.json?.severity || 'ok'), 'ok');
+      } else {
+        reapplyOk = false;
+        log('  ⛔ REAPLICAÇÃO FALHOU · sev=' + (rp.json?.severity || '?') + ' · result=' + (rp.json?.result || '') + ' — grupo ficou com cota=0. Corrija manualmente pelo portal Vivo depois.', 'err');
+      }
+      await sleep(1000);
     } else {
-      log('  ⏭ RESET pulado · cotaGrupoFrozen=0 (grupo sem cota registrada)');
+      log('  ⏭ RESET/REAPLICAÇÃO pulados · cotaGrupoFrozen=0');
     }
 
-    // ② VOLTA: GD → origem (100% UI)
+    // ⑥ VOLTA: GD → origem (100% UI) — SEMPRE roda (fallback pras linhas)
+    // Mesmo se REAPPLY falhou, garantimos que as linhas voltam pra origem.
     fecharModais(); colapsarGrupos(); await sleep(600);
-    log('  ═══ ② VOLTA: GD → "' + nome + '" ═══', 'hl');
+    log('  ═══ ⑥ VOLTA: GD → "' + nome + '" ═══', 'hl');
     const volta = await moverPorCliques(gdid, gd.name, gid, nome);
-    if (!volta.ok) return { halt: true, motivo: 'VOLTA falhou — ' + volta.motivo + ' (linhas podem estar no GD!)' };
+    if (!volta.ok) return { halt: true, motivo: 'VOLTA falhou — ' + volta.motivo + ' (linhas ficaram no GD!)' };
 
     // GATE 2: todas de volta na origem + GD vazio
     log('  · validando VOLTA (todas de volta na origem? GD vazio?)…', 'hl');
@@ -1353,38 +1403,7 @@ CHANGELOG v9.0.0
     if (!v2.ok) return { halt: true, motivo: 'VOLTA incompleta — ' + v2.motivo };
     log('  ✓ CONCILIAÇÃO: ' + N + ' de volta na origem "' + nome + '", GD vazio', 'ok');
 
-    // ④ LIBERA cota individual das linhas (uso livre) — necessário pra REAPPLY
-    // v9.9.4: as linhas voltam do GD carregando cota individual antiga (~35GB cada).
-    // Isso "prende" ~800GB do pool GD → setGroupQuota(900GB) dá HTTP 500 mesmo com
-    // linhas dentro. Zerar cota individual (payload sem quota/futureQuota) libera pool.
-    let reapplyOk = true;
-    if (cotaGrupoFrozen > 0) {
-      const freshAll = await loadViewUI(sess);
-      const gFresh = freshAll.find(x => String(x.id) === String(gid));
-      const freshLines = activeLines(gFresh || {});
-      if (freshLines.length) {
-        log('  · liberando cota individual das ' + freshLines.length + ' linhas (uso livre)…');
-        const rl = await applyQuotaToLines(gid, null, freshLines);
-        if (rl.ok) log('  ✓ linhas liberadas (payload sem quota) · pool GD livre pra reapply', 'ok');
-        else       log('  ⚠ saveLines(quota=null) falhou · sev=' + (rl.json?.severity || '?') + ' — REAPPLY provavelmente falhará também', 'err');
-        await sleep(1200);
-      }
-
-      // ⑤ REAPPLY cota do grupo — pool agora deve ter espaço
-      log('  · REAPLICANDO ' + cotaGrupoFrozen.toFixed(2) + ' GB no grupo origem [' + gid + ']…');
-      const rp = await trySetGroupQuota(gid, nome, cotaGrupoFrozen);
-      if (rp.ok) {
-        log('  ✓ cota do grupo reaplicada · sev=' + (rp.json?.severity || 'ok'), 'ok');
-      } else {
-        reapplyOk = false;
-        log('  ⛔ REAPLICAÇÃO FALHOU · sev=' + (rp.json?.severity || '?') + ' · result=' + (rp.json?.result || '') + ' — grupo ficou com cota=0. Corrija manualmente pelo portal Vivo (Editar grupo → ' + cotaGrupoFrozen.toFixed(2) + 'GB).', 'err');
-      }
-    } else {
-      log('  ⏭ REAPLICAÇÃO pulada · cotaGrupoFrozen=0');
-    }
-
-    // v9.9.4: se REAPPLY falhou, retorna ok=false pra executarLote contar como fail
-    return { ok: reapplyOk, N, cotaGrupoFrozen, reapplyOk, motivo: reapplyOk ? null : 'linhas OK (voltaram), MAS cota do grupo NÃO foi reaplicada (ficou 0)' };
+    return { ok: reapplyOk, N, cotaGrupoFrozen, motivo: reapplyOk ? null : 'linhas OK (voltaram), cota do grupo NÃO foi reaplicada (ficou 0)' };
   }
 
   /* ─────────────────────────────────────────────────────────
@@ -2310,7 +2329,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v9.9.4 (ilimitado: libera cota linhas antes de reapply + fallback status) carregado', 'ok');
+    log('✅ MoveLines + Cota v9.9.5 (ilimitado: IDA → libera linhas GD → RESET+REAPPLY → VOLTA) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
