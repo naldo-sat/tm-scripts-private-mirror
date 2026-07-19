@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.8.1
+// @version      9.9.0
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,30 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.9.0 — ILIMITADO via roundtrip GD (fluxo ui2ui) (19/07/26, 12:02)
+─────────────────────────────────────────────────────────────
+Naldo: "grupos ilimitados devem seguir EXATAMENTE a lógica do
+vivo-renova-ui2ui.user.js — movimentação integralmente pela UI".
+
+O que muda:
+  • Ilimitados NÃO passam mais pelo "GRUPO SEM LINHAS" nem pelo
+    interceptor XHR/fetch.
+  • Fluxo novo (executarLote): se isIlimitado(nome) → roundtripIlimitado(sess,gid,nome)
+  • roundtripIlimitado replica o ui2ui/roundtripManual (opts ignoraReset+ignoraCotaIlim):
+      ① origem → GD (100% cliques UI · moverPorCliques)
+      Validar IDA: N MSISDNs no GD + origem vazia
+      ② GD → origem (100% cliques UI)
+      Validar VOLTA: N MSISDNs na origem + GD vazio
+      SEM RESET de cota, SEM applyQuotaToLines — Vivo renova a franquia
+      pelo round-trip.
+  • Funções novas: validarRoundtrip (poll de identidade), roundtripIlimitado
+
+Impacto no fluxo normal: ZERO. Grupos normais continuam usando a herança
+3-em-3 via "GRUPO SEM LINHAS" (rota atual).
+
+Pré-requisito: conta precisa ter EXATAMENTE 1 grupo GD (ehGD_ui casa "GD"
+sem "5G"). Se achar 2+, aborta com log claro pedindo pra renomear.
+
 CHANGELOG v9.8.1 — Ajustes solicitados pelo Naldo (19/07/26, 11:22)
 ─────────────────────────────────────────────────────────────
 1. HERANÇA UNIFICADA (normal + ilimitado)
@@ -722,13 +746,15 @@ CHANGELOG v9.0.0
     const destinoName = (pageWindow.__moveGroupMap[String(destGroupId)] || {}).name || '';
     const destIlim = isIlimitado(destinoName);
 
+    // v9.9.0 — ilimitados NÃO passam mais aqui: o executarLote desvia pro
+    // roundtripIlimitado ANTES do move, então o interceptor nem é acionado.
+    // Mantida a detecção só por defesa (log informativo — não muda comportamento).
     if (origemIlim || destIlim) {
-      log('  · rota ILIMITADO (origem_ilim=' + origemIlim + ' · destino_ilim=' + destIlim + ') → herança de cota do grupo · SEM cota individual das linhas');
-      await postMoveFlowHeranca(false); // aplicaCotaLinhas=false
+      log('  ⚠ rota ILIMITADO detectada dentro do postMoveFlow — inesperado. Seguindo com herança completa.', 'err');
     } else {
       log('  · rota NORMAL→NORMAL → herança 3-em-3 completa (cota do grupo + cota individual das linhas)');
-      await postMoveFlowHeranca(true);  // aplicaCotaLinhas=true
     }
+    await postMoveFlowHeranca(true); // sempre aplica cota nas linhas
   }
 
   /* v9.8.1 — HERANÇA UNIFICADA
@@ -1113,6 +1139,98 @@ CHANGELOG v9.0.0
     return { ok: false, motivo: 'não confluiu em ' + Math.round(timeout / 1000) + 's (' + resumo + ')' };
   }
 
+  /* v9.9.0 — validar (poll) pra roundtrip GD (portada do ui2ui):
+     confirma que N MSISDNs esperados estão em expectGroupId E emptyGroupId
+     está funcionalmente vazio (só ativas contam). */
+  async function validarRoundtrip(sess, expectGroupId, expectMsisdns, expectCount, emptyGroupId, opt) {
+    opt = opt || {};
+    const timeout  = opt.timeout  || 45000;
+    const interval = opt.interval || 2500;
+    const t0 = Date.now();
+    let resumo = '';
+    while (Date.now() - t0 <= timeout) {
+      const all = await loadViewUI(sess);
+      const ge = all.find(x => String(x.id) === String(expectGroupId)) || {};
+      const gv = all.find(x => String(x.id) === String(emptyGroupId))  || {};
+      const geAtivas = activeLines(ge);
+      const vazioN   = activeLines(gv).length;
+      const have     = new Set(geAtivas.map(msisdnOf).filter(Boolean));
+      const faltam   = [...expectMsisdns].filter(m => !have.has(m));
+      const extras   = [...have].filter(m => !expectMsisdns.has(m));
+      if (faltam.length === 0 && extras.length === 0 && vazioN === 0 && geAtivas.length === expectCount) {
+        return { ok: true, count: geAtivas.length };
+      }
+      resumo = 'tem ' + geAtivas.length + '/' + expectCount + ' · faltam ' + faltam.length + ' · extras ' + extras.length + ' · vazio-alvo ainda com ' + vazioN;
+      log('  … aguardando confluência: ' + resumo);
+      await sleep(interval);
+    }
+    return { ok: false, motivo: 'não confluiu em ' + Math.round(timeout / 1000) + 's (' + resumo + ')' };
+  }
+
+  /* v9.9.0 — ROUNDTRIP ILIMITADO (mesma lógica do ui2ui/roundtripManual)
+     Fluxo INTEGRALMENTE via cliques UI: origem → GD → origem.
+     Sem RESET de cota. Sem reaplicação. Sem passar pelo "GRUPO SEM LINHAS".
+     Renova a franquia da Vivo via round-trip no pool GD.
+     Retorna { ok, motivo, halt } — halt=true → interrompe o batch. */
+  async function roundtripIlimitado(sess, gid, nome) {
+    fecharModais(); colapsarGrupos(); await sleep(600);
+
+    log('  · lendo grupos (loadView)…');
+    const all = await loadViewUI(sess);
+    const g = all.find(x => String(x.id) === String(gid));
+    if (!g) return { halt: true, motivo: 'grupo [' + gid + '] não encontrado no loadView' };
+
+    // GD único: precisa ser exatamente 1 (senão ambíguo)
+    const gds = all.filter(ehGD_ui);
+    if (gds.length !== 1) {
+      return { halt: true, motivo: gds.length === 0 ? 'GD não encontrado' : 'achei ' + gds.length + ' grupos GD (' + gds.map(x => x.name).join(', ') + ') — esperado exatamente 1' };
+    }
+    const gd = gds[0];
+    const gdid = String(gd.id);
+
+    // MSISDNs esperados (ativas da origem)
+    const ativas = activeLines(g);
+    const N = ativas.length;
+    if (N === 0) return { skip: true, motivo: 'origem sem ativas' };
+    const msisdnsOrigem = new Set(ativas.map(msisdnOf).filter(Boolean));
+    if (msisdnsOrigem.size !== N) {
+      return { halt: true, motivo: 'origem tem ' + N + ' ativas mas só ' + msisdnsOrigem.size + ' MSISDNs únicos — não dá pra validar por identidade' };
+    }
+
+    // GATE 0: GD funcionalmente vazio? (só ativas travam; históricas bcs='1' ignoradas)
+    const gdAtivasAntes = activeLines(gd);
+    const gdHistoricas = (gd.lines || []).length - gdAtivasAntes.length;
+    if (gdAtivasAntes.length > 0) {
+      return { halt: true, motivo: 'GD "' + gd.name + '" NÃO vazio (' + gdAtivasAntes.length + ' ativa[s]' + (gdHistoricas ? ' + ' + gdHistoricas + ' histórica[s]' : '') + ') — risco de MISTURA' };
+    }
+    if (gdHistoricas > 0) log('  · GD "' + gd.name + '": ' + gdHistoricas + ' histórica[s] (bcs=1) ignoradas no GATE 0');
+
+    // ① IDA: origem → GD (100% UI)
+    log('  ═══ ① IDA: "' + nome + '" → GD (' + N + ' linha[s]) ═══', 'hl');
+    const ida = await moverPorCliques(gid, nome, gdid, gd.name);
+    if (!ida.ok) return { halt: true, motivo: 'IDA falhou — ' + ida.motivo };
+
+    // GATE 1: todas no GD + origem vazia
+    log('  · validando IDA (todas no GD? origem vazia?)…', 'hl');
+    const v1 = await validarRoundtrip(sess, gdid, msisdnsOrigem, N, gid);
+    if (!v1.ok) return { halt: true, motivo: 'IDA incompleta — ' + v1.motivo };
+    log('  ✓ IDA validada: ' + N + ' no GD, origem vazia', 'ok');
+
+    // ② VOLTA: GD → origem (100% UI)
+    fecharModais(); colapsarGrupos(); await sleep(600);
+    log('  ═══ ② VOLTA: GD → "' + nome + '" ═══', 'hl');
+    const volta = await moverPorCliques(gdid, gd.name, gid, nome);
+    if (!volta.ok) return { halt: true, motivo: 'VOLTA falhou — ' + volta.motivo + ' (linhas podem estar no GD!)' };
+
+    // GATE 2: todas de volta na origem + GD vazio
+    log('  · validando VOLTA (todas de volta na origem? GD vazio?)…', 'hl');
+    const v2 = await validarRoundtrip(sess, gid, msisdnsOrigem, N, gdid);
+    if (!v2.ok) return { halt: true, motivo: 'VOLTA incompleta — ' + v2.motivo };
+    log('  ✓ CONCILIAÇÃO: ' + N + ' de volta na origem "' + nome + '", GD vazio', 'ok');
+
+    return { ok: true, N };
+  }
+
   /* ─────────────────────────────────────────────────────────
    *  v9.1.0 — SOM DE FIM (Web Audio, mesmo do ui2ui)
    * ───────────────────────────────────────────────────────── */
@@ -1262,6 +1380,31 @@ CHANGELOG v9.0.0
       log('▶ ' + nome + ' [' + gid + ']', 'hl');
 
       try {
+        // v9.9.0 — ILIMITADO: usa roundtrip GD (fluxo ui2ui), NÃO passa pelo "GRUPO SEM LINHAS"
+        if (isIlimitado(nome)) {
+          log('  · rota ILIMITADO → roundtrip GD (fluxo ui2ui, 100% UI)');
+          const rt = await roundtripIlimitado(sess, gid, nome);
+          if (rt.skip) {
+            log('  ↷ ' + rt.motivo + ' — pulando');
+            setProgresso(i + 1, total, 'Próximo…');
+            fecharModais(); colapsarGrupos(); await sleep(1200);
+            continue;
+          }
+          if (rt.halt) {
+            fail++;
+            log('  ⛔ roundtrip ilimitado falhou — ' + rt.motivo, 'err');
+            log('═══════ ⛔ INTERROMPIDO em "' + nome + '" — ' + ok + ' ok antes. Verifique manualmente antes de rodar de novo. ═══════', 'err');
+            parou = true;
+            break;
+          }
+          ok++;
+          log('  ✅ ilimitado concluído · ' + rt.N + ' linha(s) round-trip validado', 'ok');
+          setProgresso(i + 1, total, i + 1 === total ? 'Concluído.' : 'Próximo…');
+          fecharModais(); colapsarGrupos(); await sleep(1200);
+          continue;
+        }
+
+        // ── NORMAL: fluxo herança 3-em-3 via "GRUPO SEM LINHAS" ──
         // ── GATE 0 (pré-move): destino "GRUPO SEM LINHAS" está vazio? ──
         log('  · GATE 0: validando "GRUPO SEM LINHAS" vazio…');
         const g0 = await gateDestinoVazio(sess);
@@ -2003,7 +2146,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v9.8.1 (herança unificada) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
+    log('✅ MoveLines + Cota v9.9.0 (ilimitado via roundtrip GD) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
