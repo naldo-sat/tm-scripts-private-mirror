@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.9.1
+// @version      9.9.2
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,22 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.9.2 — Reordena reset+reaplicação ANTES da volta
+─────────────────────────────────────────────────────────────
+Naldo (19/07/26 12:23): reset e reaplicação da cota do grupo devem
+acontecer ENTRE a IDA e a VOLTA (origem vazia), não depois da VOLTA.
+Objetivo: cota restaurada ANTES das linhas retornarem — evita janela
+onde grupo tem linhas mas cota=0.
+
+Nova ordem em roundtripIlimitado:
+   0. Congela cotaGrupoFrozen
+   1. IDA origem → GD
+   2. Valida IDA
+   3. RESET cota grupo origem → 0    [aqui era antes]
+   4. REAPLICA cota grupo → cotaGrupoFrozen    [MOVIDO pra cá]
+   5. VOLTA GD → origem
+   6. Valida VOLTA
+
 CHANGELOG v9.9.1 — ILIMITADO ganha RESET + REAPLICAÇÃO da cota do grupo
 ─────────────────────────────────────────────────────────────
 Naldo (19/07/26 12:13): quer que o roundtrip ilimitado TAMBÉM faça
@@ -1247,15 +1263,24 @@ CHANGELOG v9.0.0
     if (!v1.ok) return { halt: true, motivo: 'IDA incompleta — ' + v1.motivo };
     log('  ✓ IDA validada: ' + N + ' no GD, origem vazia', 'ok');
 
-    // ③ RESET cota grupo origem (com origem vazia — liga a cota pro GD)
+    // ③ RESET + REAPLICAÇÃO da cota do grupo (com origem VAZIA, antes da volta)
+    // Naldo (19/07/26 12:23): reset e reaplicação DEVEM acontecer ANTES da volta,
+    // com a origem ainda vazia. Objetivo: restaurar a franquia antes das linhas
+    // retornarem — evita janela onde grupo tem linhas mas cota=0.
     if (cotaGrupoFrozen > 0) {
       log('  · RESET · zerando cota do grupo origem [' + gid + '] (libera ' + cotaGrupoFrozen.toFixed(2) + ' GB pro GD)…');
       const rz = await trySetGroupQuota(gid, nome, 0);
       if (rz.ok) log('  ✓ cota do grupo zerada', 'ok');
       else       log('  ⚠ RESET não confirmado · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || '') + ' — reaplicação ainda tenta', 'err');
       await sleep(1500);
+
+      log('  · REAPLICANDO ' + cotaGrupoFrozen.toFixed(2) + ' GB no grupo origem [' + gid + ']…');
+      const rp = await trySetGroupQuota(gid, nome, cotaGrupoFrozen);
+      if (rp.ok) log('  ✓ cota do grupo reaplicada · sev=' + (rp.json?.severity || 'ok'), 'ok');
+      else       log('  ⚠ REAPLICAÇÃO FALHOU · sev=' + (rp.json?.severity || '?') + ' · result=' + (rp.json?.result || '') + ' — reaplicar manualmente', 'err');
+      await sleep(1000);
     } else {
-      log('  ⏭ RESET pulado · cotaGrupoFrozen=0 (grupo sem cota registrada)');
+      log('  ⏭ RESET/REAPLICAÇÃO pulados · cotaGrupoFrozen=0 (grupo sem cota registrada)');
     }
 
     // ② VOLTA: GD → origem (100% UI)
@@ -1269,16 +1294,6 @@ CHANGELOG v9.0.0
     const v2 = await validarRoundtrip(sess, gid, msisdnsOrigem, N, gdid);
     if (!v2.ok) return { halt: true, motivo: 'VOLTA incompleta — ' + v2.motivo };
     log('  ✓ CONCILIAÇÃO: ' + N + ' de volta na origem "' + nome + '", GD vazio', 'ok');
-
-    // ④ REAPLICAÇÃO da cota do grupo (linhas ficam em uso livre — sem saveLines)
-    if (cotaGrupoFrozen > 0) {
-      log('  · REAPLICANDO ' + cotaGrupoFrozen.toFixed(2) + ' GB no grupo origem [' + gid + ']…');
-      const rp = await trySetGroupQuota(gid, nome, cotaGrupoFrozen);
-      if (rp.ok) log('  ✓ cota do grupo reaplicada · sev=' + (rp.json?.severity || 'ok'), 'ok');
-      else       log('  ⚠ REAPLICAÇÃO FALHOU · sev=' + (rp.json?.severity || '?') + ' · result=' + (rp.json?.result || '') + ' — reaplicar manualmente', 'err');
-    } else {
-      log('  ⏭ REAPLICAÇÃO pulada · cotaGrupoFrozen=0');
-    }
 
     return { ok: true, N, cotaGrupoFrozen };
   }
@@ -2198,7 +2213,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v9.9.1 (ilimitado: roundtrip GD + reset/reaplicação da cota do grupo) carregado', 'ok');
+    log('✅ MoveLines + Cota v9.9.2 (ilimitado: reset+reaplica ANTES da volta) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
