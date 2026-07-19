@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      9.9.0
+// @version      9.9.1
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,23 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v9.9.1 — ILIMITADO ganha RESET + REAPLICAÇÃO da cota do grupo
+─────────────────────────────────────────────────────────────
+Naldo (19/07/26 12:13): quer que o roundtrip ilimitado TAMBÉM faça
+reset+reaplicação, divergindo do ui2ui default (que pula ambos em ilimitado).
+Escopo: SÓ cota do GRUPO. Linhas ficam em uso livre (sem saveLines).
+
+Nova ordem em roundtripIlimitado:
+   0. Congela cotaGrupoFrozen (cache pré-move)
+   1. IDA origem → GD (100% UI)
+   2. Valida IDA
+   3. RESET cota grupo origem → 0 [NOVO]
+   4. VOLTA GD → origem (100% UI)
+   5. Valida VOLTA
+   6. REAPLICA cota grupo origem = cotaGrupoFrozen [NOVO]
+
+Se cotaGrupoFrozen=0 (grupo sem cota registrada), pula RESET e reaplicação.
+
 CHANGELOG v9.9.0 — ILIMITADO via roundtrip GD (fluxo ui2ui) (19/07/26, 12:02)
 ─────────────────────────────────────────────────────────────
 Naldo: "grupos ilimitados devem seguir EXATAMENTE a lógica do
@@ -1167,10 +1184,18 @@ CHANGELOG v9.0.0
     return { ok: false, motivo: 'não confluiu em ' + Math.round(timeout / 1000) + 's (' + resumo + ')' };
   }
 
-  /* v9.9.0 — ROUNDTRIP ILIMITADO (mesma lógica do ui2ui/roundtripManual)
-     Fluxo INTEGRALMENTE via cliques UI: origem → GD → origem.
-     Sem RESET de cota. Sem reaplicação. Sem passar pelo "GRUPO SEM LINHAS".
-     Renova a franquia da Vivo via round-trip no pool GD.
+  /* v9.9.1 — ROUNDTRIP ILIMITADO (base ui2ui + RESET/reaplicação da cota do GRUPO)
+     Naldo (19/07/26 12:13): quer que ilimitado TAMBÉM faça reset+reaplicação,
+     mas SÓ da cota do grupo (linhas continuam em uso livre — sem saveLines).
+     Fluxo:
+       0. Congela cotaGrupoFrozen (via cache)
+       1. IDA origem → GD (100% cliques UI)
+       2. Valida IDA
+       3. RESET cota grupo origem (trySetGroupQuota → 0)
+       4. VOLTA GD → origem (100% cliques UI)
+       5. Valida VOLTA
+       6. Reaplica cota grupo origem (trySetGroupQuota → cotaGrupoFrozen)
+     NÃO faz saveLines nas linhas (uso livre — decisão anterior do Naldo).
      Retorna { ok, motivo, halt } — halt=true → interrompe o batch. */
   async function roundtripIlimitado(sess, gid, nome) {
     fecharModais(); colapsarGrupos(); await sleep(600);
@@ -1197,6 +1222,12 @@ CHANGELOG v9.0.0
       return { halt: true, motivo: 'origem tem ' + N + ' ativas mas só ' + msisdnsOrigem.size + ' MSISDNs únicos — não dá pra validar por identidade' };
     }
 
+    // v9.9.1 — CONGELA cota do grupo ANTES de qualquer escrita (pra reaplicar depois)
+    await fetchDestGroupQuota(gid); // popula cache com dados atuais
+    const cacheOrigem = groupQuotaCache[String(gid)] || {};
+    const cotaGrupoFrozen = parseFloat(cacheOrigem.total) || 0;
+    log('  · cotaGrupoFrozen=' + cotaGrupoFrozen.toFixed(2) + ' GB (será reaplicada após VOLTA)');
+
     // GATE 0: GD funcionalmente vazio? (só ativas travam; históricas bcs='1' ignoradas)
     const gdAtivasAntes = activeLines(gd);
     const gdHistoricas = (gd.lines || []).length - gdAtivasAntes.length;
@@ -1216,6 +1247,17 @@ CHANGELOG v9.0.0
     if (!v1.ok) return { halt: true, motivo: 'IDA incompleta — ' + v1.motivo };
     log('  ✓ IDA validada: ' + N + ' no GD, origem vazia', 'ok');
 
+    // ③ RESET cota grupo origem (com origem vazia — liga a cota pro GD)
+    if (cotaGrupoFrozen > 0) {
+      log('  · RESET · zerando cota do grupo origem [' + gid + '] (libera ' + cotaGrupoFrozen.toFixed(2) + ' GB pro GD)…');
+      const rz = await trySetGroupQuota(gid, nome, 0);
+      if (rz.ok) log('  ✓ cota do grupo zerada', 'ok');
+      else       log('  ⚠ RESET não confirmado · sev=' + (rz.json?.severity || '?') + ' · result=' + (rz.json?.result || '') + ' — reaplicação ainda tenta', 'err');
+      await sleep(1500);
+    } else {
+      log('  ⏭ RESET pulado · cotaGrupoFrozen=0 (grupo sem cota registrada)');
+    }
+
     // ② VOLTA: GD → origem (100% UI)
     fecharModais(); colapsarGrupos(); await sleep(600);
     log('  ═══ ② VOLTA: GD → "' + nome + '" ═══', 'hl');
@@ -1228,7 +1270,17 @@ CHANGELOG v9.0.0
     if (!v2.ok) return { halt: true, motivo: 'VOLTA incompleta — ' + v2.motivo };
     log('  ✓ CONCILIAÇÃO: ' + N + ' de volta na origem "' + nome + '", GD vazio', 'ok');
 
-    return { ok: true, N };
+    // ④ REAPLICAÇÃO da cota do grupo (linhas ficam em uso livre — sem saveLines)
+    if (cotaGrupoFrozen > 0) {
+      log('  · REAPLICANDO ' + cotaGrupoFrozen.toFixed(2) + ' GB no grupo origem [' + gid + ']…');
+      const rp = await trySetGroupQuota(gid, nome, cotaGrupoFrozen);
+      if (rp.ok) log('  ✓ cota do grupo reaplicada · sev=' + (rp.json?.severity || 'ok'), 'ok');
+      else       log('  ⚠ REAPLICAÇÃO FALHOU · sev=' + (rp.json?.severity || '?') + ' · result=' + (rp.json?.result || '') + ' — reaplicar manualmente', 'err');
+    } else {
+      log('  ⏭ REAPLICAÇÃO pulada · cotaGrupoFrozen=0');
+    }
+
+    return { ok: true, N, cotaGrupoFrozen };
   }
 
   /* ─────────────────────────────────────────────────────────
@@ -1398,7 +1450,7 @@ CHANGELOG v9.0.0
             break;
           }
           ok++;
-          log('  ✅ ilimitado concluído · ' + rt.N + ' linha(s) round-trip validado', 'ok');
+          log('  ✅ ilimitado concluído · ' + rt.N + ' linha(s) · cota grupo=' + (rt.cotaGrupoFrozen || 0).toFixed(2) + 'GB reaplicada · round-trip validado', 'ok');
           setProgresso(i + 1, total, i + 1 === total ? 'Concluído.' : 'Próximo…');
           fecharModais(); colapsarGrupos(); await sleep(1200);
           continue;
@@ -2146,7 +2198,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v9.9.0 (ilimitado via roundtrip GD) carregado · aguardando movimento pra "GRUPO SEM LINHAS"', 'ok');
+    log('✅ MoveLines + Cota v9.9.1 (ilimitado: roundtrip GD + reset/reaplicação da cota do grupo) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
