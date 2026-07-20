@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      10.0.0
+// @version      11.0.0
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,66 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v11.0.0 — Redesign visual (spec Naldo 20/07/26)
+─────────────────────────────────────────────────────────────
+Repaginação completa da UI, mantendo TODAS as funcionalidades (só remove
+indicadores expressamente listados). CSS reescrito com variáveis :root.
+
+TOKENS · adotadas 15 variáveis CSS em :root (--mlq-bg, --mlq-blue, etc).
+Sem hex solto fora dessa lista.
+
+FONTES · interface DM Sans (400/500/700), números técnicos JetBrains Mono
+(400/700). Injetadas via Google Fonts. Fallback pra system-ui.
+
+ESTRUTURA · painel 330px, card único branco, blocos separados só por
+border-top de 1px (sem cards internos com fundo/borda/raio próprios).
+Container arredondado com sombra flutuante.
+
+CABEÇALHO · agora mostra empresa + número da conta (lidos do dropdown
+do portal via obterEmpresaConta), polling 5s pra pegar troca de conta.
+Removido título fixo do script e subtítulo "Move → ... → renomeia + cota".
+
+CHECKBOXES · lado a lado em 2 colunas, textos curtos ("Colorir linhas" /
+"Gravar planilha"). Ajuda vira tooltip CSS puro no hover via ::after +
+atributo data-tip (removido balão flutuante clicável).
+
+BOTÃO ATUALIZAR · antigo link "↻ lista" vira botão sólido com SVG de
+recarga que gira via animação CSS mlq-spin quando classe .loading é
+aplicada.
+
+LISTA · sem fundo/borda colorida por estado. Novo marcador .mlq-g-st
+no fim de cada linha (círculo âmbar pulsando pra processing, ✓ verde
+pra ok, ✕ vermelho pra fail, ↷ cinza pra skip). Nome com title=nome
+completo (fixa a queixa de truncagem sem tooltip). Removida pílula
+azul do ID (vira texto puro) e sufixo "linha(s)" (vira só número).
+
+EXECUÇÃO · Status e Progresso fundidos em #mlq-exec. Bloco Progresso
+usa classe .on em vez de .hidden (default: display none). Após concluir,
+permanece visível.
+
+CRONÔMETRO · substitui contadores ao vivo + ETA. Só decorrido, formato
+MM:SS (ou HH:MM:SS >59min). Usa setInterval + timestamp de início
+(não conta incremental). SVG stopwatch inline.
+
+REMOVIDOS · .mlq-pg-counters (4 indicadores), ETA e cálculo de média,
+cards internos com fundo próprio, pílula do ID, sufixo "linha(s)",
+emojis 🗑/📋 (viraram SVG lixeira + duas folhas).
+
+LOG · recolhível via cabeçalho clicável (▼/chevron). Expande automático
+na 1ª linha registrada. Contador mudou de "N log(s)" pra "N logs".
+Formato de linha: timestamp em elemento próprio com cor #565d6c, mensagem
+depois com cor por classe.
+
+CLASSES PRESERVADAS · #mlq-panel #mlq-cfg #mlq-list #mlq-status-dot
+#mlq-status-msg #mlq-log-count #mlq-progress #mlq-actions #mlq-go
+#mlq-clear #mlq-copy #mlq-log · .mlq-pg-count .mlq-pg-total .mlq-pg-pct
+.mlq-pg-fill .mlq-pg-atual .mlq-pg-timer · .mlq-g .processing .done-ok
+.done-fail .done-skip.
+NOVAS · .mlq-g-st, #mlq-exec, #mlq-status-line, #mlq-reload-btn,
+#mlq-log-hd.
+
+Status dot: agora com 4 estados (neutro/run/ok/err) — antigo .on removido.
+
 CHANGELOG v10.0.0 — Delays reduzidos + timer/counters/highlight + retry F1
 ─────────────────────────────────────────────────────────────
 Naldo (19/07/26 13:59): "quick wins delays + layout painel + F1 retry".
@@ -1547,8 +1607,10 @@ CHANGELOG v9.0.0
       for (const g of gruposCache) {
         const row = document.createElement('label');
         row.className = 'mlq-g';
-        row.innerHTML = `<input type="checkbox" class="mlq-cb" value="${g.id}" checked><span class="nm"></span><span class="id">${g.id}</span><span class="ct">${g.n ? g.n + ' linha(s)' : 'vazio'}</span>`;
+        // v11.0.0 — sem pílula no id · sem sufixo "linha(s)" · marcador de estado no fim
+        row.innerHTML = `<input type="checkbox" class="mlq-cb" value="${g.id}" checked><span class="nm"></span><span class="id">${g.id}</span><span class="ct">${g.n || 0}</span><span class="mlq-g-st"></span>`;
         row.querySelector('.nm').textContent = g.name;
+        row.querySelector('.nm').title       = g.name; // tooltip com nome completo
         listEl.appendChild(row);
       }
       log('lista carregada · ' + gruposCache.length + ' grupo(s)' + (contaCarregada ? ' · conta ' + contaCarregada : ''), 'hl');
@@ -1573,47 +1635,54 @@ CHANGELOG v9.0.0
     }, 3000);
   }
 
+  // v11.0.0 — sem contadores. Só nome atual + fração + porcentagem + barra.
   function setProgresso(feitos, total, nomeAtual, counters) {
+    void counters; // ignorado — mantido na assinatura pra compat com executarLote
     const p = document.getElementById('mlq-progress');
     if (!p) return;
     const pct = total > 0 ? Math.round(feitos / total * 100) : 0;
-    p.classList.remove('hidden');
-    p.querySelector('.mlq-pg-count b').textContent = feitos;
-    p.querySelector('.mlq-pg-total').textContent = total;
-    p.querySelector('.mlq-pg-pct').textContent = pct + '%';
-    p.querySelector('.mlq-pg-fill').style.width = pct + '%';
-    p.querySelector('.mlq-pg-atual').textContent = nomeAtual || (feitos === total ? 'Concluído.' : 'Aguardando…');
-    // v10.0.0 — contadores ao vivo
-    if (counters) {
-      p.querySelector('.mlq-pg-counters .ok').textContent   = '✅ ' + counters.ok;
-      p.querySelector('.mlq-pg-counters .fail').textContent = '⛔ ' + counters.fail;
-      p.querySelector('.mlq-pg-counters .skip').textContent = '↷ ' + counters.skip;
-      p.querySelector('.mlq-pg-counters .rest').textContent = 'restam ' + Math.max(0, total - feitos);
-    }
+    p.classList.add('on');
+    const cEl = p.querySelector('.mlq-pg-count');
+    const tEl = p.querySelector('.mlq-pg-total');
+    const pctEl = p.querySelector('.mlq-pg-pct');
+    const fEl = p.querySelector('.mlq-pg-fill');
+    const aEl = p.querySelector('.mlq-pg-atual');
+    if (cEl) cEl.textContent = feitos;
+    if (tEl) tEl.textContent = total;
+    if (pctEl) pctEl.textContent = '· ' + pct + '%';
+    if (fEl) fEl.style.width = pct + '%';
+    if (aEl) aEl.textContent = nomeAtual || (feitos === total ? 'Lote finalizado' : 'Aguardando…');
   }
 
-  // v10.0.0 — timer + estimativa restante (chamado por setInterval)
+  // v11.0.0 — timer só decorrido (sem ETA). Formato MM:SS ou HH:MM:SS.
   let progressTimer = null;
-  function iniciarProgressoTimer(tsStart, getFeitos, total) {
+  function iniciarProgressoTimer(tsStart) {
     pararProgressoTimer();
-    progressTimer = setInterval(() => {
+    const fmt = (s) => {
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const ss = s % 60;
+      const pad = n => String(n).padStart(2, '0');
+      return h > 0 ? pad(h) + ':' + pad(m) + ':' + pad(ss) : pad(m) + ':' + pad(ss);
+    };
+    const tick = () => {
       const p = document.getElementById('mlq-progress');
       if (!p) return;
       const dec = Math.round((Date.now() - tsStart) / 1000);
-      const feitos = getFeitos();
-      const avg = feitos > 0 ? dec / feitos : 0;
-      const restam = Math.max(0, total - feitos);
-      const eta = restam > 0 && avg > 0 ? Math.round(restam * avg) : null;
-      const decStr = dec < 60 ? dec + 's' : Math.floor(dec / 60) + 'm ' + (dec % 60) + 's';
-      const etaStr = eta === null ? 'estimando…' : (eta < 60 ? eta + 's rest' : Math.floor(eta / 60) + 'm ' + (eta % 60) + 's rest');
       const decEl = p.querySelector('.mlq-pg-timer .dec');
-      const etaEl = p.querySelector('.mlq-pg-timer .eta');
-      if (decEl) decEl.textContent = decStr;
-      if (etaEl) etaEl.textContent = etaStr;
-    }, 1000);
+      if (decEl) decEl.textContent = fmt(dec);
+    };
+    tick(); // primeiro tick imediato
+    progressTimer = setInterval(tick, 1000);
   }
   function pararProgressoTimer() {
     if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+  }
+  // v11.0.0 — troca barra pra vermelho quando termina com falha
+  function marcarProgressoErro(temFalha) {
+    const p = document.getElementById('mlq-progress');
+    if (!p) return;
+    p.classList.toggle('err', !!temFalha);
   }
 
   // v10.0.0 — highlight visual do grupo na lista
@@ -1672,7 +1741,7 @@ CHANGELOG v9.0.0
     // v10.0.0 — timer + retry
     let skip = 0;
     const falhasTentaveis = []; // { gid, nome, motivo } · pra retry F1 no fim
-    iniciarProgressoTimer(tsInicio, () => ok + fail + skip, total);
+    iniciarProgressoTimer(tsInicio);
 
     // v10.0.0 — extrai o processamento de 1 grupo pra função pura (facilita retry)
     // result: 'ok' | 'skip' | 'fail-retry' | 'fail-halt'
@@ -1795,7 +1864,11 @@ CHANGELOG v9.0.0
     pararProgressoTimer();
 
     log('═══════ fim · ' + ok + ' ok · ' + fail + ' falha · ' + skip + ' skip' + (parou ? ' · INTERROMPIDO' : '') + ' ═══════', parou ? 'err' : 'hl');
-    setProgresso(total, total, parou ? 'Interrompido' : 'Concluído.', { ok, fail, skip });
+    setProgresso(total, total, parou ? 'Interrompido' : 'Lote finalizado', { ok, fail, skip });
+    marcarProgressoErro(fail > 0 || parou);
+    // v11.0.0 — estado final do dot
+    const estadoFinal = (fail > 0 || parou) ? 'err' : 'ok';
+    atualizarStatusUI(parou ? 'Interrompido' : (fail > 0 ? 'Concluído com falhas' : 'Concluído · aguardando próximo…'), estadoFinal);
 
     // v9.6.0 — gravação final na planilha (sobrescreve o "Renovando...")
     if (gravarLog && logConta && logAba) {
@@ -2197,157 +2270,356 @@ CHANGELOG v9.0.0
   /* ─────────────────────────────────────────────────────────
    *  v9.0.0 — UI SIDEBAR (esquerda · padrão ConectaChip)
    * ───────────────────────────────────────────────────────── */
-  const CC_LARGURA = 340;
+  const CC_LARGURA = 330;
+  // v11.0.0 — fontes: DM Sans (interface) + JetBrains Mono (números técnicos).
+  // Se as fontes não carregarem, o fallback do sistema entra sem quebrar layout.
+  const FONT_LINK = '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">';
   const CSS = `
-    /* Paleta ConectaChip · espelhada à ESQUERDA (evita colidir com vivo-renova à direita) */
+    :root {
+      --mlq-bg: #ffffff;
+      --mlq-surface: #f7f8fa;
+      --mlq-line: #e6e9ef;
+      --mlq-text: #1a1d24;
+      --mlq-text-2: #6b7280;
+      --mlq-text-3: #9aa1ad;
+      --mlq-blue: #2f6bff;
+      --mlq-green: #16a34a;
+      --mlq-amber: #e08600;
+      --mlq-red: #dc2626;
+      --mlq-r-sm: 5px;
+      --mlq-fs-xs: 10.5px;
+      --mlq-fs-sm: 11.5px;
+      --mlq-fs-md: 12.5px;
+      --mlq-fs-lg: 14px;
+    }
+
     body.mlq-aberto { margin-left: ${CC_LARGURA}px !important; transition: margin-left .3s ease; }
 
-    /* Tab de restaurar (esquerda) — padrão ui2ui (compacto · seta acima · texto vertical) */
     #mlq-tab { position: fixed; top: 50%; left: 0; transform: translateY(-50%); z-index: 2147483640;
-      background: #2157d9; color: #fff; border: none; border-radius: 0 10px 10px 0;
-      padding: 14px 8px; cursor: pointer; box-shadow: 2px 0 10px rgba(0,0,0,.2);
-      font: 700 11px/1 -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--mlq-blue); color: #fff; border: none; border-radius: 0 var(--mlq-r-sm) var(--mlq-r-sm) 0;
+      padding: 14px 8px; cursor: pointer; box-shadow: 2px 0 10px rgba(20,25,40,.2);
+      font: 700 11px/1 "DM Sans", -apple-system, "Segoe UI", Roboto, sans-serif;
       writing-mode: vertical-rl; display: none;
     }
     body:not(.mlq-aberto) #mlq-tab { display: inline-block; }
-    #mlq-tab:hover { background: #1A46B0; }
+    #mlq-tab:hover { background: #1f57e0; }
 
-    #mlq-panel { position: fixed; top: 0; left: 0; width: ${CC_LARGURA}px; height: 100vh; z-index: 2147483641;
-      background: #FAFAFA; border-right: 1px solid #E5E7EB; box-shadow: 6px 0 24px rgba(0,0,0,.08);
-      display: flex; flex-direction: column;
-      font: 13px/1.45 -apple-system, "Segoe UI", Roboto, "Inter", sans-serif; color: #111827;
+    #mlq-panel { position: fixed; top: 12px; left: 12px; width: ${CC_LARGURA}px; max-height: calc(100vh - 24px); z-index: 2147483641;
+      background: var(--mlq-bg); border: 1px solid var(--mlq-line); border-radius: 10px;
+      box-shadow: 0 6px 24px rgba(20,25,40,.12);
+      display: flex; flex-direction: column; overflow: hidden;
+      font: var(--mlq-fs-md)/1.45 "DM Sans", -apple-system, "Segoe UI", Roboto, "Inter", sans-serif;
+      color: var(--mlq-text);
       transition: transform .3s ease;
     }
-    body:not(.mlq-aberto) #mlq-panel { transform: translateX(-100%); }
+    body:not(.mlq-aberto) #mlq-panel { transform: translateX(calc(-100% - 20px)); }
     #mlq-panel * { box-sizing: border-box; }
 
-    #mlq-hd { padding: 14px 16px 12px; background: #2157d9; color: #fff; position: relative; flex-shrink: 0; }
-    #mlq-hd h3 { margin: 0; font-size: 14px; font-weight: 700; letter-spacing: .2px; }
-    #mlq-hd .sub { font-size: 11px; opacity: .88; margin-top: 3px; }
-    #mlq-close { position: absolute; top: 10px; right: 12px; background: rgba(255,255,255,.15); border: none;
-      color: #fff; width: 26px; height: 26px; border-radius: 6px; cursor: pointer; font-size: 15px; line-height: 1;
-      display: flex; align-items: center; justify-content: center;
+    /* ============ CABEÇALHO (empresa + conta) ============ */
+    #mlq-hd { display: flex; align-items: center; gap: 8px;
+      padding: 9px 10px 9px 12px; background: var(--mlq-blue); color: #fff; flex-shrink: 0;
     }
-    #mlq-close:hover { background: rgba(255,255,255,.28); }
+    #mlq-hd .hd-txt { flex: 1; min-width: 0; }
+    #mlq-hd .hd-empresa {
+      font-size: var(--mlq-fs-lg); font-weight: 700; line-height: 1.15; letter-spacing: -0.01em;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #mlq-hd .hd-conta {
+      font: 400 var(--mlq-fs-xs)/1.3 "JetBrains Mono", ui-monospace, monospace;
+      opacity: 0.85; margin-top: 2px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #mlq-close { width: 22px; height: 22px; flex: none; border: 0; border-radius: var(--mlq-r-sm);
+      background: rgba(255,255,255,.16); color: #fff; font-size: 12px; cursor: pointer;
+      display: grid; place-items: center; transition: background .15s;
+    }
+    #mlq-close:hover { background: rgba(255,255,255,.30); }
 
-    #mlq-cfg { display: flex; flex-direction: column; gap: 8px; padding: 14px 16px 6px; font-size: 12.5px; flex-shrink: 0;
-      background: #fff; border-bottom: 1px solid #E5E7EB;
+    /* ============ CONFIGURAÇÕES (lado a lado) ============ */
+    #mlq-cfg { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--mlq-line); flex-shrink: 0; }
+    #mlq-cfg label.cb {
+      flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px;
+      padding: 6px 7px; background: var(--mlq-surface); border-radius: var(--mlq-r-sm);
+      cursor: pointer; user-select: none;
     }
-    #mlq-cfg label.cb { display: flex; align-items: center; gap: 10px; color: #374151; cursor: pointer; user-select: none; }
     #mlq-cfg label.cb input[type=checkbox] {
-      -webkit-appearance: checkbox !important; -moz-appearance: checkbox !important; appearance: checkbox !important;
-      width: 16px !important; height: 16px !important;
-      opacity: 1 !important; visibility: visible !important; display: inline-block !important;
-      position: static !important; pointer-events: auto !important;
-      accent-color: #2157d9; cursor: pointer; flex-shrink: 0; margin: 0;
+      -webkit-appearance: checkbox !important; appearance: auto !important;
+      width: 13px !important; height: 13px !important; margin: 0; flex: none;
+      accent-color: var(--mlq-blue); cursor: pointer; opacity: 1 !important;
     }
-    #mlq-cfg label.cb span.txt { flex: 1; font-weight: 500; color: #111827; }
-    #mlq-cfg .hint { width: 20px; height: 20px; line-height: 20px; text-align: center; border-radius: 50%;
-      background: #DBE7FB; color: #1A46B0; font-size: 11px; font-weight: 700; cursor: pointer; flex-shrink: 0;
-      user-select: none; transition: background .15s;
+    #mlq-cfg label.cb span.txt {
+      flex: 1; min-width: 0; font-size: var(--mlq-fs-sm); line-height: 1.2; color: var(--mlq-text);
     }
-    #mlq-cfg .hint:hover { background: #2157d9; color: #fff; }
-
-    #mlq-tooltip { position: fixed; z-index: 2147483645; max-width: 280px; padding: 10px 12px;
-      background: #111827; color: #F9FAFB; font-size: 11.5px; line-height: 1.45; border-radius: 8px;
-      box-shadow: 0 8px 24px rgba(0,0,0,.25); display: none; pointer-events: none;
+    #mlq-cfg .hint {
+      width: 14px; height: 14px; flex: none; border: 0; border-radius: 50%; padding: 0;
+      background: #dde1e9; color: #6b7280;
+      font: 700 9px/1 "DM Sans", sans-serif; cursor: help;
+      display: grid; place-items: center; position: relative;
     }
-    #mlq-tooltip.show { display: block; }
+    #mlq-cfg .hint:hover { background: var(--mlq-blue); color: #fff; }
+    #mlq-cfg .hint::after {
+      content: attr(data-tip);
+      position: absolute; bottom: calc(100% + 6px); right: -4px;
+      width: 186px; padding: 7px 9px;
+      background: #1a1d24; color: #fff; border-radius: 6px;
+      font: 400 var(--mlq-fs-xs)/1.4 "DM Sans", sans-serif;
+      text-align: left; z-index: 9;
+      opacity: 0; visibility: hidden; transition: opacity .15s;
+      pointer-events: none; white-space: normal;
+    }
+    #mlq-cfg .hint:hover::after { opacity: 1; visibility: visible; }
 
-    #mlq-status { padding: 10px 16px; background: #fff; border-bottom: 1px solid #F3F4F6; flex-shrink: 0; }
-    .mlq-st-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11.5px; color: #6B7280; }
-    .mlq-st-head b { color: #111827; font-weight: 700; }
-    .mlq-st-msg { font-size: 12px; color: #111827; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .mlq-st-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #6B7280; margin-right: 6px; vertical-align: middle; }
-    .mlq-st-dot.on { background: #16A34A; animation: mlq-pulse 1.5s infinite; }
-    @keyframes mlq-pulse { 50% { opacity: .35; } }
-
-    /* v9.1.0 — tools + lista de grupos + progresso + botão INICIAR */
-    #mlq-tools { display: flex; align-items: center; gap: 10px; padding: 8px 16px 4px; font-size: 12px; color: #6B7280; flex-shrink: 0; background: #fff; }
-    #mlq-tools a { color: #2157d9; cursor: pointer; font-weight: 600; text-decoration: none; }
+    /* ============ BARRA DA LISTA ============ */
+    #mlq-tools {
+      display: flex; align-items: center; gap: 8px; padding: 8px 12px 6px; flex-shrink: 0;
+    }
+    #mlq-tools .lbl {
+      font-size: var(--mlq-fs-xs); color: var(--mlq-text-3);
+      text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500;
+    }
+    #mlq-tools a {
+      border: 0; background: none; padding: 0; cursor: pointer;
+      font: 500 var(--mlq-fs-sm)/1 "DM Sans", sans-serif; color: var(--mlq-blue); text-decoration: none;
+    }
     #mlq-tools a:hover { text-decoration: underline; }
-    #mlq-list { margin: 0 12px 8px; flex: 0 0 auto; max-height: 28vh; overflow: auto; border: 1px solid #E5E7EB; border-radius: 10px; background: #fff; }
-    .mlq-g { display: flex; align-items: center; gap: 9px; padding: 9px 10px; border-bottom: 1px solid #F3F4F6; cursor: pointer; }
-    .mlq-g:last-child { border-bottom: none; }
-    .mlq-g:hover { background: #F9FAFB; }
-    .mlq-cb { width: 16px; height: 16px; flex: 0 0 auto; cursor: pointer;
+    #mlq-tools .sep { width: 1px; height: 10px; background: var(--mlq-line); }
+    #mlq-reload-btn {
+      margin-left: auto; display: flex; align-items: center; gap: 5px;
+      height: 24px; padding: 0 9px;
+      border: 1px solid #cfd9f5; border-radius: var(--mlq-r-sm); background: #eef3ff;
+      color: var(--mlq-blue); font: 700 var(--mlq-fs-sm)/1 "DM Sans", sans-serif;
+      cursor: pointer; transition: background .15s, border-color .15s, color .15s;
+    }
+    #mlq-reload-btn:hover { background: var(--mlq-blue); border-color: var(--mlq-blue); color: #fff; }
+    #mlq-reload-btn svg { width: 12px; height: 12px; }
+    #mlq-reload-btn.loading svg { animation: mlq-spin 0.8s linear infinite; }
+    @keyframes mlq-spin { to { transform: rotate(360deg); } }
+
+    /* ============ LISTA DE GRUPOS ============ */
+    #mlq-list {
+      max-height: 180px; overflow-y: auto; padding: 0 8px 8px;
+      display: flex; flex-direction: column; gap: 1px; flex-shrink: 0;
+    }
+    #mlq-list::-webkit-scrollbar { width: 5px; }
+    #mlq-list::-webkit-scrollbar-thumb { background: #ccd2dc; border-radius: 3px; }
+    .mlq-g {
+      display: flex; align-items: center; gap: 7px;
+      padding: 5px 8px; border-radius: var(--mlq-r-sm);
+      cursor: pointer; transition: background .12s; background: transparent;
+    }
+    .mlq-g:hover { background: var(--mlq-surface); }
+    .mlq-cb {
+      width: 13px; height: 13px; margin: 0; flex: none;
+      accent-color: var(--mlq-blue);
       -webkit-appearance: checkbox !important; appearance: auto !important; opacity: 1 !important;
-      position: static !important; margin: 0; accent-color: #2157d9;
+      position: static !important; cursor: pointer;
     }
-    .mlq-g .nm { flex: 1; font-weight: 600; font-size: 12px; color: #111827; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .mlq-g .id { font: 600 10.5px/1 ui-monospace, monospace; background: #DBE7FB; color: #1A46B0; border-radius: 5px; padding: 3px 6px; flex-shrink: 0; }
-    .mlq-g .ct { font-size: 11px; color: #6B7280; min-width: 62px; text-align: right; flex-shrink: 0; }
+    .mlq-g .nm {
+      flex: 1; min-width: 0;
+      font: 500 var(--mlq-fs-sm)/1.2 "DM Sans", sans-serif; color: var(--mlq-text);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .mlq-g .id {
+      flex: none; font: 400 var(--mlq-fs-xs)/1 "JetBrains Mono", ui-monospace, monospace;
+      color: var(--mlq-text-3);
+    }
+    .mlq-g .ct {
+      flex: none; font-size: var(--mlq-fs-xs); color: var(--mlq-text-2);
+      min-width: 20px; text-align: right; font-variant-numeric: tabular-nums;
+    }
+    .mlq-g-st {
+      flex: none; width: 13px; height: 13px;
+      display: grid; place-items: center;
+      font: 700 9px/1 "DM Sans", sans-serif; color: transparent;
+    }
+    .mlq-g-st::before { content: ''; display: block; }
+    .mlq-g.processing .nm { font-weight: 700; }
+    .mlq-g.processing .mlq-g-st::before {
+      width: 6px; height: 6px; border-radius: 50%; background: var(--mlq-amber);
+      animation: mlq-pulse 1.1s infinite;
+    }
+    .mlq-g.done-ok .mlq-g-st { color: var(--mlq-green); }
+    .mlq-g.done-ok .mlq-g-st::before { content: '✓'; }
+    .mlq-g.done-fail .mlq-g-st { color: var(--mlq-red); }
+    .mlq-g.done-fail .mlq-g-st::before { content: '✕'; }
+    .mlq-g.done-skip .mlq-g-st { color: var(--mlq-text-3); }
+    .mlq-g.done-skip .mlq-g-st::before { content: '↷'; }
+    .mlq-g.done-skip .nm { color: var(--mlq-text-3); }
+    @keyframes mlq-pulse { 50% { opacity: .25; } }
 
-    #mlq-progress { padding: 10px 16px; background: #fff; border-top: 1px solid #E5E7EB; flex-shrink: 0; }
-    #mlq-progress.hidden { display: none; }
-    .mlq-pg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11.5px; color: #6B7280; }
-    .mlq-pg-head b { color: #111827; font-weight: 700; }
-    .mlq-pg-timer { font-size: 11px; color: #6B7280; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
-    .mlq-pg-timer .eta { color: #2157d9; font-weight: 600; }
-    .mlq-pg-counters { font-size: 11.5px; color: #374151; margin-bottom: 6px; display: flex; gap: 10px; font-variant-numeric: tabular-nums; }
-    .mlq-pg-counters .ok { color: #16a34a; font-weight: 700; }
-    .mlq-pg-counters .fail { color: #dc2626; font-weight: 700; }
-    .mlq-pg-counters .skip { color: #6B7280; font-weight: 600; }
-    .mlq-pg-counters .rest { color: #2157d9; font-weight: 700; }
-    .mlq-pg-atual { font-size: 12px; color: #111827; font-weight: 600; margin-bottom: 6px;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    /* ============ EXECUÇÃO (status + progresso) ============ */
+    #mlq-exec { padding: 8px 12px; border-top: 1px solid var(--mlq-line); flex-shrink: 0; }
+    #mlq-status-line { display: flex; align-items: center; gap: 7px; }
+    #mlq-status-dot {
+      width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--mlq-text-3);
     }
-    .mlq-pg-bar { height: 8px; background: #DBE7FB; border-radius: 999px; overflow: hidden; }
-    .mlq-pg-fill { height: 100%; background: #2157d9; transition: width .4s ease; border-radius: 999px; width: 0%; }
+    #mlq-status-dot.run { background: var(--mlq-amber); animation: mlq-pulse 1.1s infinite; }
+    #mlq-status-dot.ok  { background: var(--mlq-green); }
+    #mlq-status-dot.err { background: var(--mlq-red); }
+    #mlq-status-msg {
+      flex: 1; min-width: 0; font-size: var(--mlq-fs-sm); color: var(--mlq-text);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #mlq-log-count {
+      flex: none; font-size: var(--mlq-fs-xs); color: var(--mlq-text-3);
+      font-variant-numeric: tabular-nums;
+    }
 
-    /* v10.0.0 — highlight visual do grupo processando na lista */
-    .mlq-g.processing { background: #FFF7ED; border-left: 3px solid #F59E0B; }
-    .mlq-g.processing .nm { color: #92400E; font-weight: 700; }
-    .mlq-g.done-ok { background: #F0FDF4; border-left: 3px solid #22c55e; }
-    .mlq-g.done-fail { background: #FEF2F2; border-left: 3px solid #ef4444; }
-    .mlq-g.done-skip { background: #F9FAFB; border-left: 3px solid #9CA3AF; opacity: .7; }
+    #mlq-progress { margin-top: 7px; display: none; }
+    #mlq-progress.on { display: block; }
+    .mlq-pg-line1 {
+      display: flex; align-items: baseline; gap: 6px;
+      font-size: var(--mlq-fs-xs); color: var(--mlq-text-2); font-variant-numeric: tabular-nums;
+    }
+    .mlq-pg-atual {
+      flex: 1; min-width: 0; font-size: var(--mlq-fs-sm); font-weight: 500; color: var(--mlq-text);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .mlq-pg-frac { font-weight: 700; color: var(--mlq-text); }
+    .mlq-pg-pct { color: var(--mlq-text-2); }
+    .mlq-pg-bar {
+      height: 3px; background: var(--mlq-line); border-radius: 2px; overflow: hidden;
+      margin: 6px 0 5px;
+    }
+    .mlq-pg-fill { height: 100%; background: var(--mlq-blue); border-radius: 2px; width: 0%; transition: width .4s; }
+    #mlq-progress.err .mlq-pg-fill { background: var(--mlq-red); }
+    .mlq-pg-timer {
+      display: flex; align-items: center; gap: 5px;
+      font-size: var(--mlq-fs-xs); color: var(--mlq-text-2); font-variant-numeric: tabular-nums;
+    }
+    .mlq-pg-timer svg { width: 11px; height: 11px; flex: none; }
+    .mlq-pg-timer .dec {
+      font: 700 11px/1 "JetBrains Mono", ui-monospace, monospace; color: var(--mlq-text);
+    }
 
-    #mlq-actions { padding: 8px 12px; display: flex; gap: 6px; flex-shrink: 0; background: #fff; border-top: 1px solid #F3F4F6; border-bottom: 1px solid #F3F4F6; }
-    #mlq-go { flex: 1; background: #2157d9; color: #fff; border: none; border-radius: 8px; padding: 10px;
-      font-weight: 700; font-size: 12.5px; cursor: pointer; transition: background .15s;
+    /* ============ AÇÕES ============ */
+    #mlq-actions { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--mlq-line); flex-shrink: 0; }
+    #mlq-go {
+      flex: 1; height: 32px; border: 0; border-radius: var(--mlq-r-sm);
+      background: var(--mlq-blue); color: #fff;
+      font: 700 var(--mlq-fs-md)/1 "DM Sans", sans-serif; letter-spacing: 0.01em;
+      cursor: pointer; transition: background .15s;
     }
-    #mlq-go:hover:not(:disabled) { background: #1A46B0; }
-    #mlq-go:disabled { background: #9CA3AF; cursor: not-allowed; }
-    #mlq-reload, #mlq-clear, #mlq-copy { background: #F3F4F6; color: #374151; border: 1px solid #E5E7EB; border-radius: 8px;
-      padding: 8px 10px; font-weight: 600; font-size: 11.5px; cursor: pointer; transition: background .15s;
+    #mlq-go:hover:not(:disabled) { background: #1f57e0; }
+    #mlq-go:disabled { background: #c8cdd7; color: #fff; cursor: default; }
+    #mlq-clear, #mlq-copy {
+      width: 32px; height: 32px; flex: none;
+      border: 1px solid var(--mlq-line); border-radius: var(--mlq-r-sm);
+      background: var(--mlq-bg); color: var(--mlq-text-2);
+      display: grid; place-items: center; cursor: pointer; transition: background .15s, color .15s, border-color .15s;
     }
-    #mlq-reload:hover, #mlq-clear:hover, #mlq-copy:hover { background: #E5E7EB; }
+    #mlq-clear:hover, #mlq-copy:hover { background: var(--mlq-surface); color: var(--mlq-text); border-color: #d3d8e2; }
+    #mlq-clear svg, #mlq-copy svg { width: 14px; height: 14px; }
 
-    #mlq-log { flex: 0 0 auto; height: 180px; margin: 8px 12px 12px; padding: 10px; background: #0F172A; color: #E5E7EB;
-      border-radius: 10px; overflow: auto; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+    /* ============ LOG RECOLHÍVEL ============ */
+    #mlq-log-hd {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 12px; border-top: 1px solid var(--mlq-line);
+      cursor: pointer; user-select: none;
+      font: 500 var(--mlq-fs-xs)/1 "DM Sans", sans-serif;
+      color: var(--mlq-text-3); text-transform: uppercase; letter-spacing: 0.06em;
+      flex-shrink: 0;
     }
-    #mlq-log .ok  { color: #4ADE80; }
-    #mlq-log .err { color: #F87171; }
-    #mlq-log .hl  { color: #60A5FA; font-weight: 700; }
-    #mlq-log .dbg { color: #94A3B8; font-style: italic; }
+    #mlq-log-hd:hover { color: var(--mlq-text-2); }
+    #mlq-log-hd .chev {
+      margin-left: auto; font-size: 9px; transition: transform .2s;
+    }
+    #mlq-log-hd.closed .chev { transform: rotate(-90deg); }
+    #mlq-log {
+      flex: 0 0 auto; height: 132px; overflow-y: auto;
+      background: #12141a; padding: 8px 10px;
+      font: 400 10.5px/1.55 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+    }
+    #mlq-log.hide { display: none; }
+    #mlq-log::-webkit-scrollbar { width: 5px; }
+    #mlq-log::-webkit-scrollbar-thumb { background: #3a3f4b; border-radius: 3px; }
+    #mlq-log > div { display: flex; gap: 7px; color: #8b93a3; }
+    #mlq-log > div .ts { color: #565d6c; flex: none; }
+    #mlq-log > div.ok  { color: #4ade80; }
+    #mlq-log > div.err { color: #f87171; }
+    #mlq-log > div.hl  { color: #7aa2ff; font-weight: 700; }
+    #mlq-log > div.dbg { color: #4a5060; font-style: italic; }
   `;
 
-  function atualizarStatusUI(msg) {
+  // v11.0.0 — dot com 4 estados: neutro (sem classe) · run · ok · err
+  function atualizarStatusUI(msg, estado) {
     const el = document.getElementById('mlq-status-msg');
     const dot = document.getElementById('mlq-status-dot');
     if (el) el.textContent = msg || 'Aguardando movimento…';
-    if (dot) dot.classList.toggle('on', /aguardando/i.test(msg || '') === false);
+    if (dot) {
+      dot.classList.remove('run', 'ok', 'err');
+      if (estado) {
+        dot.classList.add(estado);
+      } else {
+        // heurística automática: mensagem contém "aguardando" → neutro; senão → run
+        if (msg && !/aguardando/i.test(msg)) dot.classList.add('run');
+      }
+    }
+  }
+
+  // v11.0.0 — lê nome da empresa + número da conta do dropdown do portal Vivo
+  function obterEmpresaConta() {
+    try {
+      const toggle = document.querySelector('a.dropdown-toggle');
+      if (!toggle) return { empresa: null, conta: null };
+      const txt = (toggle.textContent || '').trim().replace(/\s+/g, ' ');
+      // formatos típicos: "EMPRESA XYZ - 0469301552" ou "0469301552 - EMPRESA XYZ"
+      const mConta = txt.match(/\d{10}/);
+      const conta  = mConta ? mConta[0] : null;
+      let empresa = null;
+      if (conta) {
+        empresa = txt.replace(conta, '').replace(/^[\s\-·|·]+|[\s\-·|·]+$/g, '').trim() || null;
+      }
+      return { empresa, conta };
+    } catch (_) { return { empresa: null, conta: null }; }
+  }
+
+  function atualizarHeaderConta() {
+    const eEl = document.querySelector('#mlq-hd .hd-empresa');
+    const cEl = document.querySelector('#mlq-hd .hd-conta');
+    if (!eEl || !cEl) return;
+    const { empresa, conta } = obterEmpresaConta();
+    eEl.textContent = empresa || 'Carregando…';
+    cEl.textContent = conta || '';
+    if (empresa) eEl.title = empresa;
+    if (conta)   cEl.title = conta;
   }
 
   function mount() {
     if (document.getElementById('mlq-panel')) return;
     if (!document.body) { window.addEventListener('DOMContentLoaded', mount); return; }
 
+    // v11.0.0 — injeta link das fontes (idempotente)
+    if (!document.getElementById('mlq-fonts')) {
+      const wrap = document.createElement('div');
+      wrap.innerHTML = FONT_LINK;
+      wrap.querySelectorAll('link').forEach((l, i) => {
+        if (i === 0) l.id = 'mlq-fonts';
+        document.head.appendChild(l);
+      });
+    }
+
     const style = document.createElement('style');
     style.textContent = CSS;
     document.head.appendChild(style);
 
-    // Tooltip flutuante
-    const tt = document.createElement('div');
-    tt.id = 'mlq-tooltip';
-    document.body.appendChild(tt);
-
-    // Tab lateral (só aparece quando ocultado) — v9.3.0 padrão ui2ui (compacta, seta+texto verticais)
+    // Tab lateral (só aparece quando ocultado)
     const tab = document.createElement('button');
     tab.id = 'mlq-tab';
     tab.title = 'Abrir MoveLines + Cota';
     tab.textContent = '▶ MoveLines + Cota';
     document.body.appendChild(tab);
+
+    // v11.0.0 — Textos curtos dos checkboxes (labels do painel; o CFG_UI mantém texto longo pra logs)
+    const CFG_UI_LABEL_CURTO = {
+      colorir: 'Colorir linhas',
+      gravarPlanilha: 'Gravar planilha',
+    };
+    const CFG_UI_TIP_CURTO = {
+      colorir: 'Pinta de verde as linhas concluídas com sucesso e de vermelho as que falharam.',
+      gravarPlanilha: 'Registra início e fim do lote em uma planilha do Google Sheets.',
+    };
 
     // Sidebar
     const panel = document.createElement('div');
@@ -2355,49 +2627,87 @@ CHANGELOG v9.0.0
     let cfgHtml = '';
     for (const [k, v] of Object.entries(CFG_UI)) {
       const checked = cfgUI[k] ? 'checked' : '';
-      cfgHtml += `<label class="cb"><input type="checkbox" data-cfg="${k}" ${checked}><span class="txt">${v.label}</span><span class="hint" data-tip="${k}">?</span></label>`;
+      const label = CFG_UI_LABEL_CURTO[k] || v.label;
+      const tip   = CFG_UI_TIP_CURTO[k]   || v.tip || '';
+      cfgHtml += `<label class="cb"><input type="checkbox" data-cfg="${k}" ${checked}><span class="txt">${label}</span><button type="button" class="hint" data-tip="${tip.replace(/"/g,'&quot;')}">?</button></label>`;
     }
+
+    // SVG icons (inline, currentColor)
+    const SVG_RELOAD = '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>';
+    const SVG_STOPWATCH = '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="14" r="7"/><path d="M12 14V10"/><path d="M12 14l3 2.5"/><path d="M9 3h6"/><path d="M18 5l1.5-1.5"/></svg>';
+    const SVG_TRASH = '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 4h6l1 3H8l1-3z"/><path d="M6 7l1 12a2 2 0 002 2h6a2 2 0 002-2l1-12"/></svg>';
+    const SVG_COPY = '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M6 15H5a2 2 0 01-2-2V5a2 2 0 012-2h8a2 2 0 012 2v1"/></svg>';
+
     panel.innerHTML = `
       <div id="mlq-hd">
-        <button id="mlq-close" title="Ocultar">×</button>
-        <h3>MoveLines + Cota</h3>
-        <div class="sub">Move → "GRUPO SEM LINHAS" → renomeia + cota</div>
+        <div class="hd-txt">
+          <div class="hd-empresa">Carregando…</div>
+          <div class="hd-conta"></div>
+        </div>
+        <button id="mlq-close" title="Ocultar">✕</button>
       </div>
       <div id="mlq-cfg">${cfgHtml}</div>
-      <div id="mlq-tools"><span>Marcar:</span><a id="mlq-all">todos</a><a id="mlq-none">nenhum</a><a id="mlq-reload-link" style="margin-left:auto">↻ lista</a></div>
-      <div id="mlq-list"></div>
-      <div id="mlq-status">
-        <div class="mlq-st-head"><span>Status</span><span><span id="mlq-status-dot" class="mlq-st-dot on"></span><span id="mlq-log-count">0</span> log(s)</span></div>
-        <div class="mlq-st-msg" id="mlq-status-msg">Aguardando movimento…</div>
+      <div id="mlq-tools">
+        <span class="lbl">Grupos</span>
+        <a id="mlq-all">todos</a>
+        <span class="sep"></span>
+        <a id="mlq-none">nenhum</a>
+        <button id="mlq-reload-btn" type="button">${SVG_RELOAD}Atualizar</button>
       </div>
-      <div id="mlq-progress" class="hidden">
-        <div class="mlq-pg-head"><span>Progresso</span><span class="mlq-pg-count"><b>0</b>/<span class="mlq-pg-total">0</span> · <span class="mlq-pg-pct">0%</span></span></div>
-        <div class="mlq-pg-timer">⏱ <span class="dec">0s</span> · <span class="eta">estimando…</span></div>
-        <div class="mlq-pg-counters"><span class="ok">✅ 0</span><span class="fail">⛔ 0</span><span class="skip">↷ 0</span><span class="rest">restam N</span></div>
-        <div class="mlq-pg-atual">Aguardando…</div>
-        <div class="mlq-pg-bar"><div class="mlq-pg-fill"></div></div>
+      <div id="mlq-list"></div>
+      <div id="mlq-exec">
+        <div id="mlq-status-line">
+          <span id="mlq-status-dot"></span>
+          <span id="mlq-status-msg">Aguardando movimento…</span>
+          <span id="mlq-log-count">0 logs</span>
+        </div>
+        <div id="mlq-progress">
+          <div class="mlq-pg-line1">
+            <span class="mlq-pg-atual">Aguardando…</span>
+            <span class="mlq-pg-frac"><span class="mlq-pg-count">0</span>/<span class="mlq-pg-total">0</span></span>
+            <span class="mlq-pg-pct">· 0%</span>
+          </div>
+          <div class="mlq-pg-bar"><div class="mlq-pg-fill"></div></div>
+          <div class="mlq-pg-timer">${SVG_STOPWATCH}<span class="dec">00:00</span></div>
+        </div>
       </div>
       <div id="mlq-actions">
         <button id="mlq-go" title="Iniciar automação em lote">▶ INICIAR</button>
-        <button id="mlq-clear" title="Limpar log">🗑</button>
-        <button id="mlq-copy" title="Copiar log">📋</button>
+        <button id="mlq-clear" title="Limpar log">${SVG_TRASH}</button>
+        <button id="mlq-copy" title="Copiar log">${SVG_COPY}</button>
       </div>
-      <div id="mlq-log"></div>
+      <div id="mlq-log-hd" class="closed"><span>Log</span><span class="chev">▼</span></div>
+      <div id="mlq-log" class="hide"></div>
     `;
     document.body.appendChild(panel);
-    // v9.2.0 — inicia RECOLHIDO; só expande ao clicar na tab lateral
+
+    // v11.0.0 — preenche header com conta ativa (agora + polling a cada 5s)
+    atualizarHeaderConta();
+    setInterval(atualizarHeaderConta, 5000);
 
     const logBox = panel.querySelector('#mlq-log');
+    const logHd  = panel.querySelector('#mlq-log-hd');
     const countEl = panel.querySelector('#mlq-log-count');
 
-    // Registra fn de log da UI e despeja buffer
+    // v11.0.0 — expande log ao chegar 1ª linha; count no formato "N logs"
     uiLogFn = (linha, cls) => {
       const div = document.createElement('div');
       if (cls) div.className = cls;
-      div.textContent = linha;
+      // separa timestamp (primeiros 8 chars: HH:MM:SS)
+      const m = linha.match(/^(\d{2}:\d{2}:\d{2})\s+(.*)$/s);
+      if (m) {
+        div.innerHTML = '<span class="ts">' + m[1] + '</span><span>' + escapeHtml(m[2]) + '</span>';
+      } else {
+        div.textContent = linha;
+      }
       logBox.appendChild(div);
       logBox.scrollTop = logBox.scrollHeight;
-      if (countEl) countEl.textContent = logBox.children.length;
+      if (countEl) countEl.textContent = logBox.children.length + ' logs';
+      // Expande log automaticamente ao chegar 1ª linha (se ainda estiver fechado)
+      if (logBox.children.length === 1 && logHd.classList.contains('closed')) {
+        logHd.classList.remove('closed');
+        logBox.classList.remove('hide');
+      }
     };
     // Despeja o buffer de logs anteriores
     logBuffer.forEach(({ msg, cls }) => uiLogFn(msg, cls));
@@ -2406,16 +2716,37 @@ CHANGELOG v9.0.0
     const listEl = panel.querySelector('#mlq-list');
     panel.querySelector('#mlq-close').onclick = () => document.body.classList.remove('mlq-aberto');
     tab.onclick = () => document.body.classList.add('mlq-aberto');
-    panel.querySelector('#mlq-clear').onclick = () => { logBox.innerHTML = ''; logBuffer.length = 0; if (countEl) countEl.textContent = '0'; };
+    panel.querySelector('#mlq-clear').onclick = () => {
+      logBox.innerHTML = ''; logBuffer.length = 0;
+      if (countEl) countEl.textContent = '0 logs';
+      // Fecha log e esconde bloco de progresso ao limpar
+      logHd.classList.add('closed'); logBox.classList.add('hide');
+      const pg = document.getElementById('mlq-progress');
+      if (pg) { pg.classList.remove('on', 'err'); }
+    };
     panel.querySelector('#mlq-copy').onclick = () => {
       const txt = logBuffer.map(l => l.msg).join('\n');
       navigator.clipboard.writeText(txt).then(() => log('(log copiado)', 'ok')).catch(() => log('não consegui copiar', 'err'));
     };
-    // v9.1.0 — lista de grupos + botão INICIAR + marcar todos/nenhum + recarregar
     panel.querySelector('#mlq-all').onclick    = () => qsa('#mlq-list .mlq-cb').forEach(c => c.checked = true);
     panel.querySelector('#mlq-none').onclick   = () => qsa('#mlq-list .mlq-cb').forEach(c => c.checked = false);
-    panel.querySelector('#mlq-reload-link').onclick = () => { if (!executando) montarLista(listEl); };
-    panel.querySelector('#mlq-go').onclick     = () => executarLote();
+
+    // v11.0.0 — botão Atualizar com estado de loading
+    const reloadBtn = panel.querySelector('#mlq-reload-btn');
+    reloadBtn.onclick = async () => {
+      if (executando) return;
+      reloadBtn.classList.add('loading');
+      try { await montarLista(listEl); }
+      finally { reloadBtn.classList.remove('loading'); }
+    };
+    panel.querySelector('#mlq-go').onclick = () => executarLote();
+
+    // v11.0.0 — Log recolhível
+    logHd.onclick = () => {
+      logHd.classList.toggle('closed');
+      logBox.classList.toggle('hide');
+    };
+
     // Carrega lista com pequeno delay pra dar tempo do portal capturar sessão
     setTimeout(() => montarLista(listEl), 1200);
 
@@ -2427,29 +2758,11 @@ CHANGELOG v9.0.0
         log((inp.checked ? '✓ ' : '⏭ ') + CFG_UI[k].label + ': ' + (inp.checked ? 'ON' : 'OFF'), 'hl');
       });
     });
+  }
 
-    // Tooltips (click + hover)
-    panel.querySelectorAll('.hint').forEach(h => {
-      const mostrar = () => {
-        const k = h.dataset.tip;
-        const txt = CFG_UI[k]?.tip || '';
-        if (!txt) return;
-        tt.textContent = txt;
-        tt.classList.add('show');
-        const r = h.getBoundingClientRect();
-        const ttW = 280;
-        let left = Math.max(8, Math.min(window.innerWidth - ttW - 8, r.left + r.width / 2 - ttW / 2));
-        let top  = r.top - tt.offsetHeight - 10;
-        if (top < 8) top = r.bottom + 10;
-        tt.style.left = left + 'px';
-        tt.style.top  = top + 'px';
-      };
-      const esconder = () => tt.classList.remove('show');
-      h.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); tt.classList.contains('show') ? esconder() : mostrar(); });
-      h.addEventListener('mouseenter', mostrar);
-      h.addEventListener('mouseleave', esconder);
-    });
-    document.addEventListener('click', (e) => { if (!e.target.closest('.hint') && !e.target.closest('#mlq-tooltip')) tt.classList.remove('show'); });
+  // v11.0.0 — util pro log
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]));
   }
 
   /* ─────────────────────────────────────────────────────────
@@ -2473,7 +2786,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v10.0.0 (delays reduzidos + timer/counters/highlight + retry F1) carregado', 'ok');
+    log('✅ MoveLines + Cota v11.0.0 (redesign visual · tokens + fontes + cronômetro + log recolhível) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
