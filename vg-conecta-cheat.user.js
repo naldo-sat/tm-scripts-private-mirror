@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - Conecta Cheat
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      2.3.0
+// @version      2.5.0
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-conecta-cheat.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-conecta-cheat.user.js
 // @description  Script unificado com painel de controle para automações do portal Vivo Gestão. (sem Ocultar Movidas)
@@ -96,16 +96,35 @@
    * ═══════════════════════════════════════════════════════════ */
 
   const FEATURES = {
-    cotaEmLote:       { label: 'Cota em Lote',           default: true },
-    pesquisaAvancada: { label: 'Pesquisa Avançada',      default: true },
-    fixConsumo:       { label: 'Fix Consumo de Dados',   default: true },
-    autoSelLinhas:    { label: 'Auto-seleção de Linhas', default: true },
-    fecharSessao:     { label: 'Fechar Sessão Expirada', default: true },
+    cotaEmLote:       { label: 'Cota em Lote',           default: true  },
+    pesquisaAvancada: { label: 'Pesquisa Avançada',      default: true  },
+    fixConsumo:       { label: 'Fix Consumo de Dados',   default: true  },
+    autoSelLinhas:    { label: 'Auto-seleção de Linhas', default: true  },
+    fecharSessao:     { label: 'Fechar Sessão Expirada', default: true  },
+    modoPrivacidade:  { label: 'Modo Privacidade',       default: false, sub: 'privacidade' },
+    resetCota:        { label: 'Resetar Cota (grupo)',   default: false, sub: 'resetCota' },
+  };
+
+  // v2.4.0 — Modo Privacidade: cada item vira classe no <body> quando ativo, e o
+  // CSS aplica filter:blur(8px) no seletor correspondente. Preserva layout e
+  // interatividade — só borra visualmente. Cada checkbox é independente.
+  const PRIVACIDADE_ITENS = {
+    consumo:  { label: 'Consumo total da conta (header)', default: true  },
+    grupo:    { label: 'Nome do grupo',                    default: true  },
+    cliente:  { label: 'Nome do cliente',                  default: true  },
+    linha:    { label: 'Número da linha',                  default: true  },
+    cota:     { label: 'Cota',                             default: false },
+    proxCota: { label: 'Próxima cota',                     default: false },
   };
 
   const state = {};
   for (const [key, cfg] of Object.entries(FEATURES)) {
     state[key] = GM_getValue('cc_' + key, cfg.default);
+  }
+  // Sub-estado do Modo Privacidade
+  const privState = {};
+  for (const [key, cfg] of Object.entries(PRIVACIDADE_ITENS)) {
+    privState[key] = GM_getValue('cc_priv_' + key, cfg.default);
   }
 
   function isOn(key)   { return state[key]; }
@@ -113,6 +132,23 @@
     state[key] = !state[key];
     GM_setValue('cc_' + key, state[key]);
     return state[key];
+  }
+  function isPrivOn(key)   { return privState[key]; }
+  function togglePriv(key) {
+    privState[key] = !privState[key];
+    GM_setValue('cc_priv_' + key, privState[key]);
+    return privState[key];
+  }
+
+  // Sincroniza classes no <body> pra ativar/desativar o blur de cada item.
+  function aplicarPrivacidade() {
+    const ativo = isOn('modoPrivacidade');
+    const body  = document.body;
+    if (!body) return;
+    body.classList.toggle('cc-priv-ativo', !!ativo);
+    for (const key of Object.keys(PRIVACIDADE_ITENS)) {
+      body.classList.toggle('cc-priv-' + key, !!(ativo && isPrivOn(key)));
+    }
   }
 
   /* ═══════════════════════════════════════════════════════════
@@ -525,6 +561,150 @@
       return 'Conta';
     }
 
+    /* ─────────────────────────────────────────────
+     *  v2.5.0 — RESETAR COTA (portado de vivo-gd-painel v3.0.0)
+     * ───────────────────────────────────────────── */
+    const RC_API = 'https://vivogestao.vivoempresas.com.br/Portal/api';
+    const RC_DP  = RC_API + '/datapackconsumption';
+    const RC_MG  = RC_API + '/datapackmanagergroup';
+    const rcEhGD = (g) => /(^|\s)GD\b|GD CONNECTA/i.test(g.name || '');
+    const rcActiveLines = (g) => (g.lines || []).filter(l => String(l.blockConsumptionStatus) !== '1');
+
+    function rcGetSession() {
+      const w = pageWindow;
+      let s = (w.VG_AUTO && w.VG_AUTO.getSession && w.VG_AUTO.getSession()) ||
+              (w.AVG_AUTO && w.AVG_AUTO.getSession && w.AVG_AUTO.getSession()) || {};
+      if (!s.sessionId) {
+        const u = performance.getEntriesByType('resource').map(e => e.name)
+          .filter(x => x.includes('datapackconsumption') && x.includes('loadView')).pop();
+        if (u) {
+          const p = new URLSearchParams(u.split('?')[1] || '');
+          s = { sessionId: p.get('sessionId'), remoteHost: p.get('remoteHost'), remoteIp: p.get('remoteIp'), acessLogin: p.get('acessLogin') };
+        }
+      }
+      return (s && s.sessionId) ? { sessionId: s.sessionId, remoteHost: s.remoteHost || '', remoteIp: s.remoteIp || '', acessLogin: s.acessLogin || '' } : null;
+    }
+
+    async function rcLoadView(sess) {
+      const qs = new URLSearchParams({ action: 'loadView', technology: '4G', startRow: '1', fetchSize: '500', ...sess });
+      const lv = await (await fetch(RC_DP + '?' + qs, { headers: { Accept: 'application/json' }, credentials: 'include' })).json();
+      const all = [];
+      (function walk(n) {
+        if (!n || typeof n !== 'object') return;
+        if (n.id != null && n.name != null) all.push(n);
+        for (const c of (Array.isArray(n) ? n : Object.values(n))) if (c && typeof c === 'object') walk(c);
+      })(lv);
+      return all;
+    }
+
+    async function rcEditGroup(sess, id, name, quotaGb) {
+      const r = await fetch(RC_MG, {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          action: 'edit', id: Number(id), name, isData: true, contextVoice: false, is5GPortifolio: 0,
+          quota: { value: String(quotaGb), dataPackValueType: 'GB' },
+          limit: { dataPackValueType: 'MIN' }, manager: { login: '' },
+          overBalanceAllCallsLimit: { dataPackValueType: 'MIN' }, overBalanceAllCallsLimitNextCycleControll: { dataPackValueType: 'MIN' },
+          overBalanceLimit: { dataPackValueType: 'R$' }, overBalanceLimitNextCycleControll: { dataPackValueType: 'R$' },
+          overBalanceLocalsLimit: { dataPackValueType: 'MIN' }, overBalanceLocalsLimitNextCycleControll: { dataPackValueType: 'MIN' },
+          technology: '4G', ...sess,
+        }),
+      });
+      const json = await r.json().catch(() => ({}));
+      return { status: r.status, json };
+    }
+
+    async function rcResetGrupo(sess, groupId, groupName) {
+      const r = await rcEditGroup(sess, Number(groupId), groupName, 0);
+      const ok = !!(r.json && (!r.json.severity || r.json.severity === 'info'));
+      if (ok) return { ok: true, motivo: 'cota zerada' };
+      const motivo = (r.json && r.json.result) || ('HTTP ' + r.status);
+      return { ok: false, motivo };
+    }
+
+    // Estado do submenu de reset
+    let _rcGrupos = [];
+    let _rcCarregando = false;
+
+    async function rcCarregarGrupos(container, logBox) {
+      if (_rcCarregando) return;
+      _rcCarregando = true;
+      container.innerHTML = '<div class="cc-rc-msg">Carregando grupos…</div>';
+      try {
+        const sess = rcGetSession();
+        if (!sess) {
+          container.innerHTML = '<div class="cc-rc-msg cc-rc-err">Sessão não encontrada. Abra a tela de Consumo de Dados e tente novamente.</div>';
+          return;
+        }
+        // v2.5.0 — TODOS os grupos (só filtra o próprio GD pra não zerar o pool)
+        const all = await rcLoadView(sess);
+        _rcGrupos = all
+          .filter(g => !rcEhGD(g))
+          .map(g => ({ id: String(g.id), name: g.name, n: rcActiveLines(g).length }))
+          .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'pt', { numeric: true }));
+        if (!_rcGrupos.length) {
+          container.innerHTML = '<div class="cc-rc-msg">Nenhum grupo encontrado.</div>';
+          return;
+        }
+        container.innerHTML = _rcGrupos.map(g => `
+          <label class="cc-rc-row">
+            <input type="checkbox" class="cc-rc-cb" value="${g.id}" data-name="${(g.name || '').replace(/"/g,'&quot;')}">
+            <span class="cc-rc-nm">${escapeHtmlCC(g.name)}</span>
+            <span class="cc-rc-id">${escapeHtmlCC(g.id)}</span>
+            <span class="cc-rc-ct ${g.n ? 'has' : ''}">${g.n ? g.n + ' linha(s)' : 'vazio'}</span>
+          </label>
+        `).join('');
+      } catch (e) {
+        container.innerHTML = '<div class="cc-rc-msg cc-rc-err">Erro: ' + escapeHtmlCC(e.message || String(e)) + '</div>';
+      } finally {
+        _rcCarregando = false;
+      }
+    }
+
+    async function rcExecutarReset(container, logBox, btn) {
+      const alvos = [...container.querySelectorAll('.cc-rc-cb:checked')].map(c => ({ id: c.value, name: c.dataset.name || '' }));
+      if (!alvos.length) { alert('Marque ao menos 1 grupo.'); return; }
+      const comLinhas = alvos.filter(a => {
+        const g = _rcGrupos.find(x => x.id === a.id); return g && g.n > 0;
+      });
+      let msg = 'Resetar cota de ' + alvos.length + ' grupo(s)?';
+      if (comLinhas.length) msg += '\n\n⚠️ ' + comLinhas.length + ' grupo(s) tem linhas ativas — o portal Vivo VAI RECUSAR (editGroup 0 só funciona em grupo VAZIO).';
+      if (!confirm(msg)) return;
+      const sess = rcGetSession();
+      if (!sess) { alert('Sessão perdida. Recarregue a página.'); return; }
+
+      btn.disabled = true; btn.textContent = 'Resetando…';
+      logBox.innerHTML = '';
+      logBox.style.display = 'block';
+      let ok = 0, fail = 0;
+      for (const a of alvos) {
+        const line = document.createElement('div');
+        line.className = 'cc-rc-log-line';
+        line.textContent = '⏳ ' + a.name + '…';
+        logBox.appendChild(line);
+        logBox.scrollTop = logBox.scrollHeight;
+        try {
+          const r = await rcResetGrupo(sess, a.id, a.name);
+          if (r.ok) { ok++; line.className = 'cc-rc-log-line cc-rc-ok'; line.textContent = '✅ ' + a.name + ' — ' + r.motivo; }
+          else     { fail++; line.className = 'cc-rc-log-line cc-rc-fail'; line.textContent = '❌ ' + a.name + ' — ' + r.motivo; }
+        } catch (e) {
+          fail++; line.className = 'cc-rc-log-line cc-rc-fail'; line.textContent = '❌ ' + a.name + ' — ' + (e.message || String(e));
+        }
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+      const sum = document.createElement('div');
+      sum.className = 'cc-rc-log-sum';
+      sum.textContent = 'Fim · ' + ok + ' ok · ' + fail + ' falha' + (fail ? ' — revisar' : '');
+      logBox.appendChild(sum);
+      logBox.scrollTop = logBox.scrollHeight;
+      btn.disabled = false; btn.textContent = 'Resetar selecionados';
+    }
+
+    function escapeHtmlCC(s) {
+      return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]));
+    }
+
     function injectStyles() {
       const css = document.createElement('style');
       css.textContent = `
@@ -602,6 +782,120 @@
           padding: 10px 18px; text-align: center;
           font-size: 12px; color: #94a3b8; border-top: 1px solid #e2e8f0;
         }
+
+        /* v2.4.0 — Sub-menu do Modo Privacidade */
+        .cc-submenu {
+          background: #f8fafc; border-top: 1px solid #e2e8f0;
+          padding: 6px 0 8px; display: none;
+        }
+        .cc-submenu.cc-submenu-open { display: block; }
+        .cc-submenu-title {
+          font-size: 11px; font-weight: 600; color: #64748b;
+          padding: 6px 18px 4px; text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .cc-sub-row {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 8px 18px 8px 32px; transition: background 0.15s;
+        }
+        .cc-sub-row:hover { background: #eef2f7; }
+        .cc-sub-row .cc-sub-label { font-size: 13px; color: #475569; user-select: none; }
+        .cc-sub-row .cc-switch { width: 34px; height: 20px; }
+        .cc-sub-row .cc-switch .cc-slider::before { width: 14px; height: 14px; }
+        .cc-sub-row .cc-switch input:checked + .cc-slider::before { transform: translateX(14px); }
+
+        /* v2.5.0 — Submenu "Resetar Cota" */
+        .cc-rc-sub {
+          padding: 8px 12px 12px;
+        }
+        .cc-rc-sub-title {
+          font-size: 11px; font-weight: 600; color: #64748b;
+          padding: 2px 2px 6px; text-transform: uppercase; letter-spacing: 0.5px;
+          display: flex; align-items: center; gap: 8px;
+        }
+        .cc-rc-sub-title button {
+          margin-left: auto; border: 1px solid #cfd9f5; background: #eef3ff;
+          color: #2157d9; font: 600 11px "DM Sans", sans-serif; padding: 4px 9px;
+          border-radius: 5px; cursor: pointer; transition: .15s;
+        }
+        .cc-rc-sub-title button:hover:not(:disabled) { background: #2157d9; color: #fff; border-color: #2157d9; }
+        .cc-rc-sub-title button:disabled { opacity: .5; cursor: default; }
+        .cc-rc-list {
+          max-height: 180px; overflow-y: auto; background: #fff;
+          border: 1px solid #e2e8f0; border-radius: 6px;
+        }
+        .cc-rc-msg {
+          padding: 12px; font-size: 12px; color: #64748b; text-align: center;
+        }
+        .cc-rc-msg.cc-rc-err { color: #dc2626; }
+        .cc-rc-row {
+          display: flex; align-items: center; gap: 8px;
+          padding: 6px 10px; border-bottom: 1px solid #f1f5f9; cursor: pointer;
+          font-size: 12px; transition: background .12s;
+        }
+        .cc-rc-row:hover { background: #f8fafc; }
+        .cc-rc-row input[type=checkbox] {
+          -webkit-appearance: checkbox !important; appearance: checkbox !important;
+          width: 14px !important; height: 14px !important;
+          opacity: 1 !important; visibility: visible !important;
+          display: inline-block !important; position: static !important;
+          margin: 0 !important; flex: none; accent-color: #2157d9; cursor: pointer;
+          border: 1px solid #c8cdd7;
+        }
+        .cc-rc-nm { flex: 1; min-width: 0; color: #0f172a; font-weight: 500;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .cc-rc-id {
+          font: 400 10.5px "JetBrains Mono", ui-monospace, monospace; color: #94a3b8;
+          flex: none;
+        }
+        .cc-rc-ct { font-size: 10.5px; color: #94a3b8; flex: none; min-width: 55px; text-align: right; }
+        .cc-rc-ct.has { color: #e08600; }
+        .cc-rc-actions {
+          display: flex; gap: 6px; margin-top: 8px;
+        }
+        .cc-rc-actions button.cc-rc-all,
+        .cc-rc-actions button.cc-rc-none {
+          border: 1px solid #e2e8f0; background: #fff; color: #64748b;
+          font: 500 11px "DM Sans", sans-serif; padding: 6px 10px;
+          border-radius: 5px; cursor: pointer;
+        }
+        .cc-rc-actions button.cc-rc-all:hover,
+        .cc-rc-actions button.cc-rc-none:hover { background: #f1f5f9; color: #334155; }
+        .cc-rc-actions button.cc-rc-go {
+          margin-left: auto; border: 0; background: #dc2626; color: #fff;
+          font: 700 11.5px "DM Sans", sans-serif; padding: 6px 12px;
+          border-radius: 5px; cursor: pointer;
+        }
+        .cc-rc-actions button.cc-rc-go:hover:not(:disabled) { background: #b91c1c; }
+        .cc-rc-actions button.cc-rc-go:disabled { background: #94a3b8; cursor: default; }
+        .cc-rc-log {
+          margin-top: 8px; padding: 8px 10px; background: #0f172a;
+          border-radius: 5px; max-height: 140px; overflow-y: auto;
+          font: 400 10.5px "JetBrains Mono", ui-monospace, monospace;
+          color: #cbd5e1; display: none;
+        }
+        .cc-rc-log-line { padding: 2px 0; color: #cbd5e1; }
+        .cc-rc-log-line.cc-rc-ok { color: #4ade80; }
+        .cc-rc-log-line.cc-rc-fail { color: #f87171; }
+        .cc-rc-log-sum {
+          margin-top: 6px; padding-top: 6px; border-top: 1px solid #334155;
+          color: #94a3b8; font-weight: 700;
+        }
+
+        /* v2.4.0 — Modo Privacidade: aplica blur nos elementos configurados.
+           filter:blur mantém layout e interatividade, borra apenas o visual. */
+        body.cc-priv-consumo .total-consume-progress,
+        body.cc-priv-consumo .total-consume-div,
+        body.cc-priv-consumo .plus-tooltip1,
+        body.cc-priv-consumo .plus-tooltip2 { filter: blur(8px) !important; }
+        body.cc-priv-grupo    div[style*="max-width: 80%"] { filter: blur(7px) !important; }
+        body.cc-priv-cliente  div.col-md-3[style*="16%"] p,
+        body.cc-priv-cliente  div.col-md-3[style*="width:16%"] p { filter: blur(7px) !important; }
+        body.cc-priv-linha    .col-md-2.nopadding-right p { filter: blur(6px) !important; }
+        body.cc-priv-cota     .col-md-1.padding-top-9 { filter: blur(6px) !important; }
+        body.cc-priv-proxCota .col-md-2.padding-top-9 { filter: blur(6px) !important; }
+        /* Nunca borra o próprio painel (defensivo — caso algum seletor casse dentro dele) */
+        body.cc-priv-ativo #cc-modal, body.cc-priv-ativo #cc-overlay, body.cc-priv-ativo #cc-fab { filter: none !important; }
       `;
       document.head.appendChild(css);
     }
@@ -646,13 +940,56 @@
           </label>
         `;
         body.appendChild(row);
+
+        // v2.4.0 — sub-menu de itens (só o "modoPrivacidade" tem)
+        if (cfg.sub === 'privacidade') {
+          const sub = document.createElement('div');
+          sub.className = 'cc-submenu' + (isOn(key) ? ' cc-submenu-open' : '');
+          sub.id = 'cc-submenu-privacidade';
+          let subHtml = '<div class="cc-submenu-title">Ocultar (blur) durante gravação</div>';
+          for (const [pk, pcfg] of Object.entries(PRIVACIDADE_ITENS)) {
+            subHtml += `
+              <div class="cc-sub-row">
+                <span class="cc-sub-label">${pcfg.label}</span>
+                <label class="cc-switch">
+                  <input type="checkbox" data-cc-priv="${pk}" ${isPrivOn(pk) ? 'checked' : ''}>
+                  <span class="cc-slider"></span>
+                </label>
+              </div>`;
+          }
+          sub.innerHTML = subHtml;
+          body.appendChild(sub);
+        }
+
+        // v2.5.0 — submenu de reset de cota
+        if (cfg.sub === 'resetCota') {
+          const sub = document.createElement('div');
+          sub.className = 'cc-submenu' + (isOn(key) ? ' cc-submenu-open' : '');
+          sub.id = 'cc-submenu-resetCota';
+          sub.innerHTML = `
+            <div class="cc-rc-sub">
+              <div class="cc-rc-sub-title">
+                <span>Selecione o(s) grupo(s)</span>
+                <button class="cc-rc-reload" type="button" title="Recarregar lista">↻ Atualizar</button>
+              </div>
+              <div class="cc-rc-list" id="cc-rc-list"><div class="cc-rc-msg">Ligue e clique em Atualizar</div></div>
+              <div class="cc-rc-actions">
+                <button class="cc-rc-all" type="button">todos</button>
+                <button class="cc-rc-none" type="button">nenhum</button>
+                <button class="cc-rc-go" type="button">Resetar selecionados</button>
+              </div>
+              <div class="cc-rc-log" id="cc-rc-log"></div>
+            </div>
+          `;
+          body.appendChild(sub);
+        }
       }
 
       modal.appendChild(body);
 
       const footer = document.createElement('div');
       footer.id = 'cc-modal-footer';
-      footer.textContent = 'v2.3.0 — Conecta Cheat';
+      footer.textContent = 'v2.4.0 — Conecta Cheat';
       modal.appendChild(footer);
 
       overlay.appendChild(modal);
@@ -660,10 +997,49 @@
       // Event handlers
       body.addEventListener('change', (e) => {
         const inp = e.target;
+        // Feature principal
         if (inp.dataset.ccKey) {
           const key = inp.dataset.ccKey;
           const newState = toggle(key);
           console.log(`%c[CC] ${FEATURES[key].label}: ${newState ? 'ON' : 'OFF'}`, 'color:#3b82f6;font-weight:bold;');
+          // v2.4.0 — Modo Privacidade: mostra/esconde sub-menu e re-aplica
+          if (key === 'modoPrivacidade') {
+            const sub = document.getElementById('cc-submenu-privacidade');
+            if (sub) sub.classList.toggle('cc-submenu-open', newState);
+            aplicarPrivacidade();
+          }
+          // v2.5.0 — Resetar Cota: abre/fecha submenu e carrega lista ao abrir
+          if (key === 'resetCota') {
+            const sub = document.getElementById('cc-submenu-resetCota');
+            if (sub) sub.classList.toggle('cc-submenu-open', newState);
+            if (newState) {
+              const listEl = document.getElementById('cc-rc-list');
+              const logEl  = document.getElementById('cc-rc-log');
+              if (listEl) rcCarregarGrupos(listEl, logEl);
+            }
+          }
+        }
+        // Sub-checkbox de Privacidade
+        if (inp.dataset.ccPriv) {
+          const pk = inp.dataset.ccPriv;
+          const newState = togglePriv(pk);
+          console.log(`%c[CC][Priv] ${PRIVACIDADE_ITENS[pk].label}: ${newState ? 'ON' : 'OFF'}`, 'color:#8b5cf6;font-weight:bold;');
+          aplicarPrivacidade();
+        }
+      });
+
+      // v2.5.0 — Handlers do submenu de reset (click delegado)
+      body.addEventListener('click', (e) => {
+        const listEl = document.getElementById('cc-rc-list');
+        const logEl  = document.getElementById('cc-rc-log');
+        if (e.target.matches('.cc-rc-reload')) {
+          if (listEl) rcCarregarGrupos(listEl, logEl);
+        } else if (e.target.matches('.cc-rc-all')) {
+          if (listEl) listEl.querySelectorAll('.cc-rc-cb').forEach(c => c.checked = true);
+        } else if (e.target.matches('.cc-rc-none')) {
+          if (listEl) listEl.querySelectorAll('.cc-rc-cb').forEach(c => c.checked = false);
+        } else if (e.target.matches('.cc-rc-go')) {
+          if (listEl && logEl) rcExecutarReset(listEl, logEl, e.target);
         }
       });
 
@@ -684,6 +1060,9 @@
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && overlay.classList.contains('cc-open')) closePanel();
       });
+
+      // v2.4.0 — aplica estado inicial de privacidade (persistido)
+      aplicarPrivacidade();
     }
 
     if (document.body) buildUI();
@@ -695,6 +1074,6 @@
    *  BOOT
    * ═══════════════════════════════════════════════════════════ */
 
-  console.log('%c[Conecta Cheat] ✅ v2.3.0 — carregado.', 'color:#22c55e;font-weight:bold;');
+  console.log('%c[Conecta Cheat] ✅ v2.5.0 — carregado (+ Resetar Cota).', 'color:#22c55e;font-weight:bold;');
 
 })();
