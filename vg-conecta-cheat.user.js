@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - Conecta Cheat
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      2.5.0
+// @version      2.5.1
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-conecta-cheat.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-conecta-cheat.user.js
 // @description  Script unificado com painel de controle para automações do portal Vivo Gestão. (sem Ocultar Movidas)
@@ -637,21 +637,32 @@
           container.innerHTML = '<div class="cc-rc-msg cc-rc-err">Sessão não encontrada. Abra a tela de Consumo de Dados e tente novamente.</div>';
           return;
         }
-        // v2.5.0 — TODOS os grupos (só filtra o próprio GD pra não zerar o pool)
+        // v2.5.1 — TODOS os grupos (inclui GD com badge de aviso)
         const all = await rcLoadView(sess);
         _rcGrupos = all
-          .filter(g => !rcEhGD(g))
-          .map(g => ({ id: String(g.id), name: g.name, n: rcActiveLines(g).length }))
-          .sort((a, b) => (a.name || '').localeCompare(b.name || '', 'pt', { numeric: true }));
+          .filter(g => g.id != null && g.name)
+          .map(g => ({
+            id: String(g.id),
+            name: g.name,
+            n: rcActiveLines(g).length,
+            isGD: rcEhGD(g),
+            cotaAtual: parseFloat(g.quota?.value) || 0,
+          }))
+          .sort((a, b) => {
+            // GD por último; resto por nome
+            if (a.isGD !== b.isGD) return a.isGD ? 1 : -1;
+            return (a.name || '').localeCompare(b.name || '', 'pt', { numeric: true });
+          });
         if (!_rcGrupos.length) {
           container.innerHTML = '<div class="cc-rc-msg">Nenhum grupo encontrado.</div>';
           return;
         }
         container.innerHTML = _rcGrupos.map(g => `
-          <label class="cc-rc-row">
-            <input type="checkbox" class="cc-rc-cb" value="${g.id}" data-name="${(g.name || '').replace(/"/g,'&quot;')}">
-            <span class="cc-rc-nm">${escapeHtmlCC(g.name)}</span>
+          <label class="cc-rc-row${g.isGD ? ' is-gd' : ''}">
+            <input type="checkbox" class="cc-rc-cb" value="${g.id}" data-name="${(g.name || '').replace(/"/g,'&quot;')}" data-gd="${g.isGD ? '1' : '0'}" data-cota="${g.cotaAtual}">
+            <span class="cc-rc-nm">${escapeHtmlCC(g.name)}${g.isGD ? '<span class="cc-rc-gd-tag" title="Pool GD — cuidado ao editar">GD</span>' : ''}</span>
             <span class="cc-rc-id">${escapeHtmlCC(g.id)}</span>
+            <span class="cc-rc-cota" title="Cota atual">${g.cotaAtual ? g.cotaAtual + 'GB' : '—'}</span>
             <span class="cc-rc-ct ${g.n ? 'has' : ''}">${g.n ? g.n + ' linha(s)' : 'vazio'}</span>
           </label>
         `).join('');
@@ -662,19 +673,41 @@
       }
     }
 
-    async function rcExecutarReset(container, logBox, btn) {
-      const alvos = [...container.querySelectorAll('.cc-rc-cb:checked')].map(c => ({ id: c.value, name: c.dataset.name || '' }));
+    // v2.5.1 — refatorado: aceita `qty` fixa (Reset=0) OU per-alvo (edit prompt)
+    async function rcAplicarCota(container, logBox, btn, opts) {
+      const alvos = [...container.querySelectorAll('.cc-rc-cb:checked')].map(c => ({
+        id: c.value,
+        name: c.dataset.name || '',
+        isGD: c.dataset.gd === '1',
+        cotaAtual: parseFloat(c.dataset.cota) || 0,
+      }));
       if (!alvos.length) { alert('Marque ao menos 1 grupo.'); return; }
+      const qty = opts.qty;
+      const acao = opts.acao; // 'reset' ou 'edit'
+      const btnTxtOriginal = btn.textContent;
+
+      // Avisos
       const comLinhas = alvos.filter(a => {
         const g = _rcGrupos.find(x => x.id === a.id); return g && g.n > 0;
       });
-      let msg = 'Resetar cota de ' + alvos.length + ' grupo(s)?';
-      if (comLinhas.length) msg += '\n\n⚠️ ' + comLinhas.length + ' grupo(s) tem linhas ativas — o portal Vivo VAI RECUSAR (editGroup 0 só funciona em grupo VAZIO).';
+      const gds = alvos.filter(a => a.isGD);
+
+      let msg = (acao === 'reset' ? 'Resetar' : 'Editar') + ' cota de ' + alvos.length + ' grupo(s)';
+      if (acao === 'reset') msg += ' para 0 GB?';
+      else msg += ' para ' + qty + ' GB?';
+      if (gds.length) {
+        msg += '\n\n⚠️ ' + gds.length + ' GRUPO(S) GD SELECIONADO(S). Alterar a cota do GD muda o POOL de dados da conta inteira — pode desconfigurar todos os grupos filho. Prossiga só se tem certeza.';
+      }
+      if (acao === 'reset' && comLinhas.length) {
+        msg += '\n\n⚠️ ' + comLinhas.length + ' grupo(s) com linhas ativas — Vivo RECUSA editGroup(0) em grupo com linhas.';
+      }
       if (!confirm(msg)) return;
+
       const sess = rcGetSession();
       if (!sess) { alert('Sessão perdida. Recarregue a página.'); return; }
 
-      btn.disabled = true; btn.textContent = 'Resetando…';
+      btn.disabled = true;
+      btn.textContent = (acao === 'reset' ? 'Resetando…' : 'Salvando…');
       logBox.innerHTML = '';
       logBox.style.display = 'block';
       let ok = 0, fail = 0;
@@ -685,9 +718,11 @@
         logBox.appendChild(line);
         logBox.scrollTop = logBox.scrollHeight;
         try {
-          const r = await rcResetGrupo(sess, a.id, a.name);
-          if (r.ok) { ok++; line.className = 'cc-rc-log-line cc-rc-ok'; line.textContent = '✅ ' + a.name + ' — ' + r.motivo; }
-          else     { fail++; line.className = 'cc-rc-log-line cc-rc-fail'; line.textContent = '❌ ' + a.name + ' — ' + r.motivo; }
+          const r = await rcEditGroup(sess, Number(a.id), a.name, qty);
+          const rok = !!(r.json && (!r.json.severity || r.json.severity === 'info'));
+          const motivo = rok ? ('cota → ' + qty + ' GB') : ((r.json && r.json.result) || ('HTTP ' + r.status));
+          if (rok) { ok++; line.className = 'cc-rc-log-line cc-rc-ok'; line.textContent = '✅ ' + a.name + ' — ' + motivo; }
+          else     { fail++; line.className = 'cc-rc-log-line cc-rc-fail'; line.textContent = '❌ ' + a.name + ' — ' + motivo; }
         } catch (e) {
           fail++; line.className = 'cc-rc-log-line cc-rc-fail'; line.textContent = '❌ ' + a.name + ' — ' + (e.message || String(e));
         }
@@ -698,7 +733,21 @@
       sum.textContent = 'Fim · ' + ok + ' ok · ' + fail + ' falha' + (fail ? ' — revisar' : '');
       logBox.appendChild(sum);
       logBox.scrollTop = logBox.scrollHeight;
-      btn.disabled = false; btn.textContent = 'Resetar selecionados';
+      btn.disabled = false; btn.textContent = btnTxtOriginal;
+    }
+
+    function rcExecutarReset(container, logBox, btn) {
+      return rcAplicarCota(container, logBox, btn, { qty: 0, acao: 'reset' });
+    }
+
+    function rcExecutarEditar(container, logBox, btn) {
+      const alvos = container.querySelectorAll('.cc-rc-cb:checked');
+      if (!alvos.length) { alert('Marque ao menos 1 grupo.'); return; }
+      const raw = prompt('Digite a nova cota em GB (número inteiro ou decimal):', '');
+      if (raw === null) return;
+      const v = parseFloat(String(raw).replace(',', '.'));
+      if (isNaN(v) || v < 0) { alert('Valor inválido. Use um número >= 0.'); return; }
+      return rcAplicarCota(container, logBox, btn, { qty: v, acao: 'edit' });
     }
 
     function escapeHtmlCC(s) {
@@ -843,10 +892,22 @@
         }
         .cc-rc-nm { flex: 1; min-width: 0; color: #0f172a; font-weight: 500;
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+          display: flex; align-items: center; gap: 6px;
         }
+        .cc-rc-gd-tag {
+          font: 700 9px "DM Sans", sans-serif; letter-spacing: 0.5px;
+          color: #92400e; background: #fef3c7; border: 1px solid #fbbf24;
+          padding: 1px 5px; border-radius: 3px; flex: none;
+        }
+        .cc-rc-row.is-gd { background: #fffbeb; }
+        .cc-rc-row.is-gd:hover { background: #fef3c7; }
         .cc-rc-id {
           font: 400 10.5px "JetBrains Mono", ui-monospace, monospace; color: #94a3b8;
           flex: none;
+        }
+        .cc-rc-cota {
+          font: 600 10.5px "JetBrains Mono", ui-monospace, monospace; color: #2157d9;
+          flex: none; min-width: 42px; text-align: right;
         }
         .cc-rc-ct { font-size: 10.5px; color: #94a3b8; flex: none; min-width: 55px; text-align: right; }
         .cc-rc-ct.has { color: #e08600; }
@@ -861,8 +922,15 @@
         }
         .cc-rc-actions button.cc-rc-all:hover,
         .cc-rc-actions button.cc-rc-none:hover { background: #f1f5f9; color: #334155; }
+        .cc-rc-actions button.cc-rc-edit {
+          margin-left: auto; border: 0; background: #2157d9; color: #fff;
+          font: 700 11.5px "DM Sans", sans-serif; padding: 6px 12px;
+          border-radius: 5px; cursor: pointer;
+        }
+        .cc-rc-actions button.cc-rc-edit:hover:not(:disabled) { background: #1a46b0; }
+        .cc-rc-actions button.cc-rc-edit:disabled { background: #94a3b8; cursor: default; }
         .cc-rc-actions button.cc-rc-go {
-          margin-left: auto; border: 0; background: #dc2626; color: #fff;
+          border: 0; background: #dc2626; color: #fff;
           font: 700 11.5px "DM Sans", sans-serif; padding: 6px 12px;
           border-radius: 5px; cursor: pointer;
         }
@@ -976,7 +1044,8 @@
               <div class="cc-rc-actions">
                 <button class="cc-rc-all" type="button">todos</button>
                 <button class="cc-rc-none" type="button">nenhum</button>
-                <button class="cc-rc-go" type="button">Resetar selecionados</button>
+                <button class="cc-rc-edit" type="button" title="Editar cota (informa o valor)">Editar cota…</button>
+                <button class="cc-rc-go" type="button" title="Resetar cota para 0 GB">Resetar (0)</button>
               </div>
               <div class="cc-rc-log" id="cc-rc-log"></div>
             </div>
@@ -1040,6 +1109,8 @@
           if (listEl) listEl.querySelectorAll('.cc-rc-cb').forEach(c => c.checked = false);
         } else if (e.target.matches('.cc-rc-go')) {
           if (listEl && logEl) rcExecutarReset(listEl, logEl, e.target);
+        } else if (e.target.matches('.cc-rc-edit')) {
+          if (listEl && logEl) rcExecutarEditar(listEl, logEl, e.target);
         }
       });
 
@@ -1074,6 +1145,6 @@
    *  BOOT
    * ═══════════════════════════════════════════════════════════ */
 
-  console.log('%c[Conecta Cheat] ✅ v2.5.0 — carregado (+ Resetar Cota).', 'color:#22c55e;font-weight:bold;');
+  console.log('%c[Conecta Cheat] ✅ v2.5.1 — carregado (+ Editar/Resetar Cota, inclui GD).', 'color:#22c55e;font-weight:bold;');
 
 })();
