@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      11.0.1
+// @version      11.0.2
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -2605,19 +2605,49 @@ CHANGELOG v9.0.0
     }
   }
 
-  // v11.0.0 — lê nome da empresa + número da conta do dropdown do portal Vivo
+  // v11.0.2 — lê conta (e empresa quando disponível) do portal Vivo.
+  // Fonte primária: div.item-option com <p>Conta</p> + <p class="item-desc">NNN</p>.
+  // Fallbacks: a.dropdown-toggle, ou qualquer texto com \d{10} no header.
   function obterEmpresaConta() {
     try {
-      const toggle = document.querySelector('a.dropdown-toggle');
-      if (!toggle) return { empresa: null, conta: null };
-      const txt = (toggle.textContent || '').trim().replace(/\s+/g, ' ');
-      // formatos típicos: "EMPRESA XYZ - 0469301552" ou "0469301552 - EMPRESA XYZ"
-      const mConta = txt.match(/\d{10}/);
-      const conta  = mConta ? mConta[0] : null;
-      let empresa = null;
-      if (conta) {
-        empresa = txt.replace(conta, '').replace(/^[\s\-·|·]+|[\s\-·|·]+$/g, '').trim() || null;
+      let empresa = null, conta = null;
+
+      // Fonte primária: item-option (padrão observado no portal)
+      const itens = document.querySelectorAll('div.item-option');
+      for (const it of itens) {
+        const ps = it.querySelectorAll('p');
+        if (ps.length < 2) continue;
+        const label = (ps[0].textContent || '').trim().toLowerCase();
+        const desc  = (it.querySelector('.item-desc')?.textContent || ps[1].textContent || '').trim();
+        if (!desc) continue;
+        if (/^conta/i.test(label) && /^\d{6,}$/.test(desc)) conta = desc;
+        else if (/^(empresa|raz[aã]o|cliente|nome)/i.test(label) && !conta && !empresa) empresa = desc;
+        else if (/^(empresa|raz[aã]o|cliente|nome)/i.test(label)) empresa = desc;
       }
+
+      // Fallback 1: dropdown-toggle (versão antiga do portal)
+      if (!conta) {
+        const toggle = document.querySelector('a.dropdown-toggle');
+        if (toggle) {
+          const txt = (toggle.textContent || '').trim().replace(/\s+/g, ' ');
+          const mConta = txt.match(/\d{10}/);
+          if (mConta) {
+            conta = mConta[0];
+            if (!empresa) {
+              const rest = txt.replace(conta, '').replace(/^[\s\-·|]+|[\s\-·|]+$/g, '').trim();
+              if (rest) empresa = rest;
+            }
+          }
+        }
+      }
+
+      // Fallback 2: qualquer \d{10} num header/menu do portal
+      if (!conta) {
+        const headerTxt = (document.querySelector('header, .header, .navbar')?.textContent || '').trim();
+        const m = headerTxt.match(/\d{10}/);
+        if (m) conta = m[0];
+      }
+
       return { empresa, conta };
     } catch (_) { return { empresa: null, conta: null }; }
   }
@@ -2845,7 +2875,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v11.0.1 (checkboxes visíveis · header fallback conta · log 180px + seta destacada) carregado', 'ok');
+    log('✅ MoveLines + Cota v11.0.2 (header conta lê div.item-option) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
