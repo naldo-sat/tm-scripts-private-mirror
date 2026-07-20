@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      11.0.2
+// @version      11.0.3
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -2390,32 +2390,42 @@ CHANGELOG v9.0.0
       display: grid; place-items: center; position: relative;
     }
     #mlq-cfg .hint:hover { background: var(--mlq-blue); color: #fff; }
-    #mlq-cfg .hint::after {
-      content: attr(data-tip);
-      position: absolute; bottom: calc(100% + 6px); right: -4px;
-      width: 186px; padding: 7px 9px;
-      background: #1a1d24; color: #fff; border-radius: 6px;
-      font: 400 var(--mlq-fs-xs)/1.4 "DM Sans", sans-serif;
-      text-align: left; z-index: 9;
-      opacity: 0; visibility: hidden; transition: opacity .15s;
-      pointer-events: none; white-space: normal;
+
+    /* v11.0.3 — tooltip flutuante fora do overflow do painel (não corta) */
+    #mlq-tooltip {
+      position: fixed; z-index: 2147483645; max-width: 240px;
+      padding: 8px 10px; background: #1a1d24; color: #fff;
+      border-radius: 6px; box-shadow: 0 8px 24px rgba(20,25,40,.25);
+      font: 400 var(--mlq-fs-xs)/1.4 "DM Sans", -apple-system, sans-serif;
+      text-align: left; pointer-events: none; display: none; white-space: normal;
     }
-    #mlq-cfg .hint:hover::after { opacity: 1; visibility: visible; }
+    #mlq-tooltip.show { display: block; }
 
     /* ============ BARRA DA LISTA ============ */
     #mlq-tools {
       display: flex; align-items: center; gap: 8px; padding: 8px 12px 6px; flex-shrink: 0;
     }
+    #mlq-tools .master {
+      display: flex; align-items: center; gap: 7px; cursor: pointer; user-select: none;
+    }
+    #mlq-tools .master:hover .lbl { color: var(--mlq-text-2); }
+    #mlq-tools .master input[type=checkbox] {
+      -webkit-appearance: checkbox !important;
+      -moz-appearance: checkbox !important;
+      appearance: checkbox !important;
+      width: 14px !important; height: 14px !important;
+      min-width: 14px !important; min-height: 14px !important;
+      opacity: 1 !important; visibility: visible !important;
+      display: inline-block !important; position: static !important;
+      pointer-events: auto !important; margin: 0 !important; flex: none;
+      accent-color: var(--mlq-blue); cursor: pointer;
+      border: 1px solid #c8cdd7; background: #fff;
+    }
     #mlq-tools .lbl {
       font-size: var(--mlq-fs-xs); color: var(--mlq-text-3);
       text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500;
+      transition: color .15s;
     }
-    #mlq-tools a {
-      border: 0; background: none; padding: 0; cursor: pointer;
-      font: 500 var(--mlq-fs-sm)/1 "DM Sans", sans-serif; color: var(--mlq-blue); text-decoration: none;
-    }
-    #mlq-tools a:hover { text-decoration: underline; }
-    #mlq-tools .sep { width: 1px; height: 10px; background: var(--mlq-line); }
     #mlq-reload-btn {
       margin-left: auto; display: flex; align-items: center; gap: 5px;
       height: 24px; padding: 0 9px;
@@ -2657,23 +2667,27 @@ CHANGELOG v9.0.0
     const cEl = document.querySelector('#mlq-hd .hd-conta');
     if (!eEl || !cEl) return;
     const { empresa, conta } = obterEmpresaConta();
-    // v11.0.1 — fallback: se não achou empresa mas achou conta, mostra conta na linha 1
-    if (empresa && conta) {
-      eEl.textContent = empresa;
-      cEl.textContent = conta;
-      eEl.title = empresa;
-      cEl.title = conta;
-      cEl.style.display = '';
+    // v11.0.3 — se tem conta, tenta enriquecer com empresa do mapa `abasPorConta`
+    // (mais confiável que scraping do dropdown do portal).
+    const empresaDoMapa = (conta && abasPorConta[conta]) ? abasPorConta[conta] : null;
+    const empresaFinal  = empresaDoMapa || empresa || null;
+
+    if (conta && empresaFinal) {
+      // Formato: número na frente + separador + nome da empresa (linha única grande).
+      eEl.textContent = conta + ' · ' + empresaFinal;
+      eEl.title = conta + ' · ' + empresaFinal;
+      cEl.textContent = '';
+      cEl.style.display = 'none';
     } else if (conta) {
       eEl.textContent = 'Conta ' + conta;
-      cEl.textContent = '';
-      cEl.style.display = 'none';
       eEl.title = conta;
-    } else if (empresa) {
-      eEl.textContent = empresa;
       cEl.textContent = '';
       cEl.style.display = 'none';
-      eEl.title = empresa;
+    } else if (empresaFinal) {
+      eEl.textContent = empresaFinal;
+      eEl.title = empresaFinal;
+      cEl.textContent = '';
+      cEl.style.display = 'none';
     } else {
       eEl.textContent = 'Carregando…';
       cEl.textContent = '';
@@ -2699,11 +2713,16 @@ CHANGELOG v9.0.0
     style.textContent = CSS;
     document.head.appendChild(style);
 
+    // v11.0.3 — Tooltip flutuante (position: fixed no body, não corta pelo overflow do painel)
+    const tt = document.createElement('div');
+    tt.id = 'mlq-tooltip';
+    document.body.appendChild(tt);
+
     // Tab lateral (só aparece quando ocultado)
     const tab = document.createElement('button');
     tab.id = 'mlq-tab';
     tab.title = 'Abrir MoveLines + Cota';
-    tab.textContent = '▶ MoveLines + Cota';
+    tab.textContent = '▶ Renovação';
     document.body.appendChild(tab);
 
     // v11.0.0 — Textos curtos dos checkboxes (labels do painel; o CFG_UI mantém texto longo pra logs)
@@ -2743,10 +2762,7 @@ CHANGELOG v9.0.0
       </div>
       <div id="mlq-cfg">${cfgHtml}</div>
       <div id="mlq-tools">
-        <span class="lbl">Grupos</span>
-        <a id="mlq-all">todos</a>
-        <span class="sep"></span>
-        <a id="mlq-none">nenhum</a>
+        <label class="master" title="Selecionar todos"><input type="checkbox" id="mlq-master" checked><span class="lbl">Grupos</span></label>
         <button id="mlq-reload-btn" type="button">${SVG_RELOAD}Atualizar</button>
       </div>
       <div id="mlq-list"></div>
@@ -2817,15 +2833,33 @@ CHANGELOG v9.0.0
       const txt = logBuffer.map(l => l.msg).join('\n');
       navigator.clipboard.writeText(txt).then(() => log('(log copiado)', 'ok')).catch(() => log('não consegui copiar', 'err'));
     };
-    panel.querySelector('#mlq-all').onclick    = () => qsa('#mlq-list .mlq-cb').forEach(c => c.checked = true);
-    panel.querySelector('#mlq-none').onclick   = () => qsa('#mlq-list .mlq-cb').forEach(c => c.checked = false);
+    // v11.0.3 — checkbox mestre (substitui todos/nenhum)
+    const masterCb = panel.querySelector('#mlq-master');
+    function sincronizarMaster() {
+      const boxes = qsa('#mlq-list .mlq-cb');
+      if (!boxes.length) { masterCb.checked = false; masterCb.indeterminate = false; return; }
+      const marcados = boxes.filter(c => c.checked).length;
+      masterCb.checked      = marcados === boxes.length;
+      masterCb.indeterminate = marcados > 0 && marcados < boxes.length;
+    }
+    masterCb.addEventListener('change', () => {
+      const val = masterCb.checked;
+      qsa('#mlq-list .mlq-cb').forEach(c => c.checked = val);
+      masterCb.indeterminate = false;
+    });
+    // sincroniza quando o usuário marca/desmarca item individual
+    listEl.addEventListener('change', (e) => {
+      if (e.target && e.target.classList.contains('mlq-cb')) sincronizarMaster();
+    });
+    // expõe função pra sincronizar depois de recargas
+    panel.__mlqSyncMaster = sincronizarMaster;
 
     // v11.0.0 — botão Atualizar com estado de loading
     const reloadBtn = panel.querySelector('#mlq-reload-btn');
     reloadBtn.onclick = async () => {
       if (executando) return;
       reloadBtn.classList.add('loading');
-      try { await montarLista(listEl); }
+      try { await montarLista(listEl); sincronizarMaster(); }
       finally { reloadBtn.classList.remove('loading'); }
     };
     panel.querySelector('#mlq-go').onclick = () => executarLote();
@@ -2837,7 +2871,7 @@ CHANGELOG v9.0.0
     };
 
     // Carrega lista com pequeno delay pra dar tempo do portal capturar sessão
-    setTimeout(() => montarLista(listEl), 1200);
+    setTimeout(async () => { await montarLista(listEl); sincronizarMaster(); }, 1200);
 
     // Checkboxes
     panel.querySelectorAll('input[data-cfg]').forEach(inp => {
@@ -2846,6 +2880,35 @@ CHANGELOG v9.0.0
         setCfg(k, inp.checked);
         log((inp.checked ? '✓ ' : '⏭ ') + CFG_UI[k].label + ': ' + (inp.checked ? 'ON' : 'OFF'), 'hl');
       });
+    });
+
+    // v11.0.3 — tooltip flutuante nos "?" (position:fixed no body, sem corte)
+    panel.querySelectorAll('#mlq-cfg .hint').forEach(h => {
+      const mostrar = () => {
+        const txt = h.dataset.tip || '';
+        if (!txt) return;
+        tt.textContent = txt;
+        tt.classList.add('show');
+        // Posiciona: prefere ACIMA do "?" com alinhamento à ESQUERDA do painel
+        // (evita corte à direita). Se não couber acima, coloca abaixo.
+        const r = h.getBoundingClientRect();
+        const ttW = Math.min(240, tt.offsetWidth || 240);
+        const margin = 8;
+        // horizontal: alinha à direita do "?" ancorando a borda direita do tooltip com a direita do "?"
+        let left = r.right - ttW;
+        if (left < margin) left = margin;
+        if (left + ttW > window.innerWidth - margin) left = window.innerWidth - ttW - margin;
+        // vertical: acima se cabe, senão abaixo
+        let top = r.top - tt.offsetHeight - 6;
+        if (top < margin) top = r.bottom + 6;
+        tt.style.left = left + 'px';
+        tt.style.top  = top + 'px';
+      };
+      const esconder = () => tt.classList.remove('show');
+      h.addEventListener('mouseenter', mostrar);
+      h.addEventListener('mouseleave', esconder);
+      h.addEventListener('focus', mostrar);
+      h.addEventListener('blur', esconder);
     });
   }
 
@@ -2875,7 +2938,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v11.0.2 (header conta lê div.item-option) carregado', 'ok');
+    log('✅ MoveLines + Cota v11.0.3 (checkbox mestre · tooltip fixed · header conta+empresa · tab "Renovação") carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
