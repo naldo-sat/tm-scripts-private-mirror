@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      11.0.3
+// @version      11.0.4
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -2673,9 +2673,9 @@ CHANGELOG v9.0.0
     const empresaFinal  = empresaDoMapa || empresa || null;
 
     if (conta && empresaFinal) {
-      // Formato: número na frente + separador + nome da empresa (linha única grande).
-      eEl.textContent = conta + ' · ' + empresaFinal;
-      eEl.title = conta + ' · ' + empresaFinal;
+      // v11.0.4 — nome da empresa primeiro, número depois
+      eEl.textContent = empresaFinal + ' · ' + conta;
+      eEl.title = empresaFinal + ' · ' + conta;
       cEl.textContent = '';
       cEl.style.display = 'none';
     } else if (conta) {
@@ -2938,7 +2938,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v11.0.3 (checkbox mestre · tooltip fixed · header conta+empresa · tab "Renovação") carregado', 'ok');
+    log('✅ MoveLines + Cota v11.0.4 (header: empresa · conta) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
