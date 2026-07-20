@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VG 2026 - MoveLines + Quota (Auto)
 // @namespace    https://vivogestao.vivoempresas.com.br/
-// @version      11.0.0
+// @version      11.0.1
 // @updateURL    https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @downloadURL  https://raw.githubusercontent.com/naldo-sat/tm-scripts-private-mirror/main/vg-movelines-quota.user.js
 // @description  Detecta moveLines para "GRUPO SEM LINHAS", renomeia grupos, aplica cota. Sidebar esquerda com config + log em tempo real (padrão ConectaChip).
@@ -15,6 +15,32 @@
 // ==/UserScript==
 
 /*
+CHANGELOG v11.0.1 — Ajustes pós-redesign (20/07/26 06:07)
+─────────────────────────────────────────────────────────────
+Naldo reportou 3 problemas após rodar a v11.0.0:
+
+1. CHECKBOXES INVISÍVEIS
+   O portal Vivo aplica reset agressivo em `input[type=checkbox]`. Reforçadas
+   as regras em #mlq-cfg + .mlq-cb com todos os !important necessários
+   (-webkit/-moz/appearance, opacity, visibility, display, position,
+   pointer-events, margin, min-width/height). Adicionada borda cinza clara
+   como fallback visual caso accent-color não pegue.
+
+2. HEADER SÓ COM "CARREGANDO…"
+   obterEmpresaConta() nem sempre acha o nome da empresa no dropdown
+   (formato varia). Adicionado fallback:
+     - empresa+conta → linha 1: empresa, linha 2: conta
+     - só conta      → linha 1: "Conta 0469301552", linha 2 oculta
+     - só empresa    → linha 1: empresa, linha 2 oculta
+     - nada          → linha 1: "Carregando…"
+
+3. LOG PEQUENO + SETA POUCO VISÍVEL
+   Altura voltou pra 180px (era 132px na v11.0.0). Cabeçalho ganhou fundo
+   var(--mlq-surface), fonte maior (--mlq-fs-sm) em peso 700, cor de texto
+   mais destacada. Chevron virou botão 22x22 com fundo, borda e cor azul.
+   Log NÃO começa mais fechado — abre por padrão, usuário controla via
+   chevron. Removido auto-expand na 1ª linha (não precisa mais).
+
 CHANGELOG v11.0.0 — Redesign visual (spec Naldo 20/07/26)
 ─────────────────────────────────────────────────────────────
 Repaginação completa da UI, mantendo TODAS as funcionalidades (só remove
@@ -2343,9 +2369,16 @@ CHANGELOG v9.0.0
       cursor: pointer; user-select: none;
     }
     #mlq-cfg label.cb input[type=checkbox] {
-      -webkit-appearance: checkbox !important; appearance: auto !important;
-      width: 13px !important; height: 13px !important; margin: 0; flex: none;
-      accent-color: var(--mlq-blue); cursor: pointer; opacity: 1 !important;
+      -webkit-appearance: checkbox !important;
+      -moz-appearance: checkbox !important;
+      appearance: checkbox !important;
+      width: 14px !important; height: 14px !important;
+      min-width: 14px !important; min-height: 14px !important;
+      opacity: 1 !important; visibility: visible !important;
+      display: inline-block !important; position: static !important;
+      pointer-events: auto !important; margin: 0 !important; flex: none;
+      accent-color: var(--mlq-blue); cursor: pointer;
+      border: 1px solid #c8cdd7; background: #fff;
     }
     #mlq-cfg label.cb span.txt {
       flex: 1; min-width: 0; font-size: var(--mlq-fs-sm); line-height: 1.2; color: var(--mlq-text);
@@ -2409,10 +2442,16 @@ CHANGELOG v9.0.0
     }
     .mlq-g:hover { background: var(--mlq-surface); }
     .mlq-cb {
-      width: 13px; height: 13px; margin: 0; flex: none;
-      accent-color: var(--mlq-blue);
-      -webkit-appearance: checkbox !important; appearance: auto !important; opacity: 1 !important;
-      position: static !important; cursor: pointer;
+      -webkit-appearance: checkbox !important;
+      -moz-appearance: checkbox !important;
+      appearance: checkbox !important;
+      width: 14px !important; height: 14px !important;
+      min-width: 14px !important; min-height: 14px !important;
+      opacity: 1 !important; visibility: visible !important;
+      display: inline-block !important; position: static !important;
+      pointer-events: auto !important; margin: 0 !important; flex: none;
+      accent-color: var(--mlq-blue); cursor: pointer;
+      border: 1px solid #c8cdd7; background: #fff;
     }
     .mlq-g .nm {
       flex: 1; min-width: 0;
@@ -2513,22 +2552,30 @@ CHANGELOG v9.0.0
 
     /* ============ LOG RECOLHÍVEL ============ */
     #mlq-log-hd {
-      display: flex; align-items: center; gap: 6px;
-      padding: 6px 12px; border-top: 1px solid var(--mlq-line);
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; border-top: 1px solid var(--mlq-line);
       cursor: pointer; user-select: none;
-      font: 500 var(--mlq-fs-xs)/1 "DM Sans", sans-serif;
-      color: var(--mlq-text-3); text-transform: uppercase; letter-spacing: 0.06em;
-      flex-shrink: 0;
+      font: 700 var(--mlq-fs-sm)/1 "DM Sans", sans-serif;
+      color: var(--mlq-text-2); text-transform: uppercase; letter-spacing: 0.06em;
+      flex-shrink: 0; background: var(--mlq-surface);
+      transition: background .15s, color .15s;
     }
-    #mlq-log-hd:hover { color: var(--mlq-text-2); }
+    #mlq-log-hd:hover { background: #eef1f6; color: var(--mlq-text); }
     #mlq-log-hd .chev {
-      margin-left: auto; font-size: 9px; transition: transform .2s;
+      margin-left: auto;
+      display: grid; place-items: center;
+      width: 22px; height: 22px; border-radius: var(--mlq-r-sm);
+      background: var(--mlq-bg); color: var(--mlq-blue);
+      font-size: 12px; font-weight: 700;
+      border: 1px solid var(--mlq-line);
+      transition: transform .2s, background .15s;
     }
+    #mlq-log-hd:hover .chev { background: #eef3ff; }
     #mlq-log-hd.closed .chev { transform: rotate(-90deg); }
     #mlq-log {
-      flex: 0 0 auto; height: 132px; overflow-y: auto;
-      background: #12141a; padding: 8px 10px;
-      font: 400 10.5px/1.55 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      flex: 0 0 auto; height: 180px; overflow-y: auto;
+      background: #12141a; padding: 10px 12px;
+      font: 400 11px/1.55 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
       white-space: pre-wrap;
     }
     #mlq-log.hide { display: none; }
@@ -2580,10 +2627,28 @@ CHANGELOG v9.0.0
     const cEl = document.querySelector('#mlq-hd .hd-conta');
     if (!eEl || !cEl) return;
     const { empresa, conta } = obterEmpresaConta();
-    eEl.textContent = empresa || 'Carregando…';
-    cEl.textContent = conta || '';
-    if (empresa) eEl.title = empresa;
-    if (conta)   cEl.title = conta;
+    // v11.0.1 — fallback: se não achou empresa mas achou conta, mostra conta na linha 1
+    if (empresa && conta) {
+      eEl.textContent = empresa;
+      cEl.textContent = conta;
+      eEl.title = empresa;
+      cEl.title = conta;
+      cEl.style.display = '';
+    } else if (conta) {
+      eEl.textContent = 'Conta ' + conta;
+      cEl.textContent = '';
+      cEl.style.display = 'none';
+      eEl.title = conta;
+    } else if (empresa) {
+      eEl.textContent = empresa;
+      cEl.textContent = '';
+      cEl.style.display = 'none';
+      eEl.title = empresa;
+    } else {
+      eEl.textContent = 'Carregando…';
+      cEl.textContent = '';
+      cEl.style.display = 'none';
+    }
   }
 
   function mount() {
@@ -2676,8 +2741,8 @@ CHANGELOG v9.0.0
         <button id="mlq-clear" title="Limpar log">${SVG_TRASH}</button>
         <button id="mlq-copy" title="Copiar log">${SVG_COPY}</button>
       </div>
-      <div id="mlq-log-hd" class="closed"><span>Log</span><span class="chev">▼</span></div>
-      <div id="mlq-log" class="hide"></div>
+      <div id="mlq-log-hd"><span>Log</span><span class="chev">▼</span></div>
+      <div id="mlq-log"></div>
     `;
     document.body.appendChild(panel);
 
@@ -2703,11 +2768,6 @@ CHANGELOG v9.0.0
       logBox.appendChild(div);
       logBox.scrollTop = logBox.scrollHeight;
       if (countEl) countEl.textContent = logBox.children.length + ' logs';
-      // Expande log automaticamente ao chegar 1ª linha (se ainda estiver fechado)
-      if (logBox.children.length === 1 && logHd.classList.contains('closed')) {
-        logHd.classList.remove('closed');
-        logBox.classList.remove('hide');
-      }
     };
     // Despeja o buffer de logs anteriores
     logBuffer.forEach(({ msg, cls }) => uiLogFn(msg, cls));
@@ -2719,8 +2779,7 @@ CHANGELOG v9.0.0
     panel.querySelector('#mlq-clear').onclick = () => {
       logBox.innerHTML = ''; logBuffer.length = 0;
       if (countEl) countEl.textContent = '0 logs';
-      // Fecha log e esconde bloco de progresso ao limpar
-      logHd.classList.add('closed'); logBox.classList.add('hide');
+      // v11.0.1 — não mexe mais no toggle do log (usuário controla via chevron)
       const pg = document.getElementById('mlq-progress');
       if (pg) { pg.classList.remove('on', 'err'); }
     };
@@ -2786,7 +2845,7 @@ CHANGELOG v9.0.0
     setInterval(() => { if (isCfg('colorir')) restoreColors(); }, 1500);
     mount();
     iniciarWatchdogConta();
-    log('✅ MoveLines + Cota v11.0.0 (redesign visual · tokens + fontes + cronômetro + log recolhível) carregado', 'ok');
+    log('✅ MoveLines + Cota v11.0.1 (checkboxes visíveis · header fallback conta · log 180px + seta destacada) carregado', 'ok');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
